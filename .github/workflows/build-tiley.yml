@@ -127,7 +127,7 @@ jobs:
 
             - name: Merge and Extract Tiles
               run: |
-                  mkdir -p final_tiles_extracted
+                  mkdir -p final_ tiles_extracted
                   tile-join \
                     --no-tile-size-limit \
                     -e final_tiles_extracted \
