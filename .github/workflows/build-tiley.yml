@@ -31,8 +31,8 @@ jobs:
               id: regions
               run: |
                   if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.region }}" = "ALL_REGIONS" ]; then
-                    # Split the regions array into sub-arrays of maximum 50 elements each
-                    echo "batches=$(jq -c '[_nwise(50)]' regions.json)" >> "$GITHUB_OUTPUT"
+                    # Split the regions array into sub-arrays
+                    echo "batches=$(jq -c '[_nwise(10)]' regions.json)" >> "$GITHUB_OUTPUT"
                   else
                     # For manual single-region runs, wrap the region into a single-item batch structure
                     echo "batches=[[\"${{ github.event.inputs.region }}\"]]" >> "$GITHUB_OUTPUT"
