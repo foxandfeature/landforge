@@ -18,25 +18,27 @@ permissions:
     contents: write
 
 jobs:
-    # Job 1: Prepare matrix regions
+    # Job 1: Prepare matrix regions (Batched into chunks of 50 to bypass GitHub's 256 matrix limit)
     prepare:
         runs-on: ubuntu-latest
         outputs:
-            regions: ${{ steps.regions.outputs.regions }}
+            batches: ${{ steps.regions.outputs.batches }}
         steps:
             - name: Checkout Repository
               uses: actions/checkout@v4
 
-            - name: Load Region List
+            - name: Load and Chunk Region List
               id: regions
               run: |
                   if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.region }}" = "ALL_REGIONS" ]; then
-                    echo "regions=$(jq -c . regions.json)" >> "$GITHUB_OUTPUT"
+                    # Split the regions array into sub-arrays of maximum 50 elements each
+                    echo "batches=$(jq -c '[_nwise(50)]' regions.json)" >> "$GITHUB_OUTPUT"
                   else
-                    echo "regions=[\"${{ github.event.inputs.region }}\"]" >> "$GITHUB_OUTPUT"
+                    # For manual single-region runs, wrap the region into a single-item batch structure
+                    echo "batches=[[\"${{ github.event.inputs.region }}\"]]" >> "$GITHUB_OUTPUT"
                   fi
 
-    # Job 2: Parallel processing of regions
+    # Job 2: Parallel processing of region batches
     build-tiles:
         needs: prepare
         runs-on: ubuntu-latest
@@ -44,7 +46,7 @@ jobs:
             fail-fast: false
             max-parallel: 8
             matrix:
-                region: ${{ fromJSON(needs.prepare.outputs.regions) }}
+                batch: ${{ fromJSON(needs.prepare.outputs.batches) }}
 
         steps:
             - name: Checkout Repository
@@ -56,15 +58,11 @@ jobs:
                   git clone --depth 1 https://github.com/felt/tippecanoe.git
                   cd tippecanoe && make -j$(nproc) && sudo make install
 
-            - name: Process Region Data (Inverse Masking via Poly)
+            - name: Create Python Helper Script
+              # Writing the script to a file avoids escaping issues with the EOF heredoc inside the Bash loop
               run: |
-                  # Download Geofabrik boundaries and water shapefile
-                  wget "https://download.geofabrik.de/${{ matrix.region }}.poly" -O region.poly
-                  wget "https://download.geofabrik.de/${{ matrix.region }}-latest-free.shp.zip" -O region.shp.zip
-                  unzip region.shp.zip "gis_osm_water_a_free_1.*"
-
-                  # Convert Geofabrik .poly to a clean WKT string (Handles MultiPolygons smoothly)
-                  python3 - << 'EOF'
+                  cat << 'EOF' > poly2wkt.py
+                  import sys
                   polygons = []
                   current = []
                   with open('region.poly') as f:
@@ -83,23 +81,45 @@ jobs:
                   with open('boundary.wkt', 'w') as out: out.write(wkt)
                   EOF
 
-                  # Punch out water structures from the high-fidelity poly boundary
-                  ogr2ogr -f GeoJSON land_layer.geojson gis_osm_water_a_free_1.shp \
-                    -dialect sqlite \
-                    -sql "SELECT ST_Difference(ST_GeomFromText('$(cat boundary.wkt)'), ST_Union(ST_MakeValid(geometry))) AS geometry FROM gis_osm_water_a_free_1"
-
-            - name: Generate Regional MBTiles
+            - name: Process Region Data (Loop through Batch)
               run: |
-                  FILENAME=$(echo "${{ matrix.region }}" | tr '/' '-').mbtiles
-                  tippecanoe -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
-                  echo "FILENAME=$FILENAME" >> "$GITHUB_ENV"
+                  # Extract individual regions from the matrix batch JSON array
+                  REGIONS=$(echo '${{ toJSON(matrix.batch) }}' | jq -r '.[]')
 
-            - name: Upload Temporary Regional Artifact
-              if: ${{ hashFiles(env.FILENAME) != '' }}
+                  for REGION in $REGIONS; do
+                      echo "========================================"
+                      echo "Processing Region: $REGION"
+                      echo "========================================"
+                      
+                      # Download Geofabrik boundaries and water shapefile
+                      wget "https://download.geofabrik.de/${REGION}.poly" -O region.poly
+                      wget "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" -O region.shp.zip
+                      
+                      # The -o flag overwrites files from previous loop iterations
+                      unzip -o region.shp.zip "gis_osm_water_a_free_1.*"
+
+                      # Convert Geofabrik .poly to a clean WKT string
+                      python3 poly2wkt.py
+
+                      # Punch out water structures from the high-fidelity poly boundary
+                      ogr2ogr -f GeoJSON land_layer.geojson gis_osm_water_a_free_1.shp \
+                        -dialect sqlite \
+                        -sql "SELECT ST_Difference(ST_GeomFromText('$(cat boundary.wkt)'), ST_Union(ST_MakeValid(geometry))) AS geometry FROM gis_osm_water_a_free_1"
+
+                      # Generate Regional MBTiles
+                      FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
+                      tippecanoe -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
+                      
+                      # Clean up workspace files to prepare for the next iteration
+                      rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson
+                  done
+
+            - name: Upload Batch Artifact
+              # Upload all .mbtiles generated in this batch together to reduce API overhead
               uses: actions/upload-artifact@v4
               with:
-                  name: ${{ env.FILENAME }}
-                  path: ${{ env.FILENAME }}
+                  name: mbtiles-batch-${{ strategy.job-index }}
+                  path: "*.mbtiles"
                   retention-days: 1
 
     # Job 3: Merge, extract MBTiles, and deploy
@@ -118,16 +138,16 @@ jobs:
                   git clone --depth 1 https://github.com/felt/tippecanoe.git
                   cd tippecanoe && make -j$(nproc) && sudo make install
 
-            - name: Download All Generated MBTiles
+            - name: Download All Generated MBTiles Batches
               uses: actions/download-artifact@v4
               with:
-                  pattern: "*.mbtiles"
+                  pattern: mbtiles-batch-*
                   path: download_mbtiles
                   merge-multiple: true
 
             - name: Merge and Extract Tiles
               run: |
-                  mkdir -p final_ tiles_extracted
+                  mkdir -p final_tiles_extracted
                   tile-join \
                     --no-tile-size-limit \
                     -e final_tiles_extracted \
