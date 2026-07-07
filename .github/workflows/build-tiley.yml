@@ -31,7 +31,7 @@ jobs:
               id: regions
               run: |
                   if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.region }}" = "ALL_REGIONS" ]; then
-                    echo "regions=$(jq -c . .github/regions.json)" >> "$GITHUB_OUTPUT"
+                    echo "regions=$(jq -c . regions.json)" >> "$GITHUB_OUTPUT"
                   else
                     echo "regions=[\"${{ github.event.inputs.region }}\"]" >> "$GITHUB_OUTPUT"
                   fi
