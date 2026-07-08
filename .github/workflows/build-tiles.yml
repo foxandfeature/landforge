@@ -146,10 +146,17 @@ jobs:
                       # Convert Geofabrik .poly structure to a clean WKT string
                       python3 poly2wkt.py
 
-                      # Punch out BOTH inland water (rivers/lakes) and the sea/ocean from the
-                      # boundary in a single pass. VirtualOGR() exposes the global water-polygons
-                      # shapefile directly as an extra table; the WHERE clause on that subquery
-                      # restricts it to features intersecting this region before ST_Union runs.
+                      # Step 1: Clip the global ocean/sea polygons to this region's boundary.
+                      # -clipsrc uses the .qix spatial index, so only overlapping chunks of the
+                      # planet-wide file are read — this is fast even for the ~1 GB source file.
+                      ogr2ogr -f GeoJSON ocean_clip.geojson water-polygons/water_polygons.shp \
+                        -clipsrc "$(cat boundary.wkt)"
+
+                      # Step 2: Subtract BOTH inland water (rivers/lakes) AND the clipped ocean
+                      # from the boundary polygon in a single SQL pass.
+                      # VirtualOGR() works here because it references a GeoJSON file (not a
+                      # Shapefile directly in FROM), which avoids the CREATE VIRTUAL TABLE
+                      # limitation of the SQLite dialect.
                       ogr2ogr -f GeoJSON land_layer.geojson gis_osm_water_a_free_1.shp \
                         -dialect sqlite \
                         -sql "
@@ -163,8 +170,7 @@ jobs:
                             FROM (
                                 SELECT geometry FROM gis_osm_water_a_free_1
                                 UNION ALL
-                                SELECT geometry FROM VirtualOGR('water-polygons/water_polygons.shp')
-                                WHERE ST_Intersects(geometry, ST_GeomFromText('$(cat boundary.wkt)'))
+                                SELECT geometry FROM VirtualOGR('ocean_clip.geojson')
                             )
                         "
 
@@ -180,7 +186,7 @@ jobs:
                       echo "| \`$REGION\` | $ELAPSED_TIME |" >> $GITHUB_STEP_SUMMARY
                       
                       # Clean up workspace files to prepare for the next iteration
-                      rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson
+                      rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt ocean_clip.geojson land_layer.geojson
                   done
 
             - name: Upload Batch Artifact
