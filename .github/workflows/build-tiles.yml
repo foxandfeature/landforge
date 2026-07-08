@@ -120,8 +120,8 @@ jobs:
               # Convert Geofabrik .poly structure to a clean WKT string
               python3 poly2wkt.py
 
-              # 1. Clip the global ocean dataset to the local region boundary for maximum performance
-              ogr2ogr -f "ESRI Shapefile" local_ocean.shp ocean_data/water-polygons-split-4326/water_polygons.shp -clipsrc boundary.wkt
+              # 1. Clip the global ocean dataset using the inline WKT string string content
+              ogr2ogr -f "ESRI Shapefile" local_ocean.shp ocean_data/water-polygons-split-4326/water_polygons.shp -clipsrc "$(cat boundary.wkt)"
 
               # 2. Combine inland water bodies and the clipped ocean dataset into a single shapefile
               ogr2ogr -f "ESRI Shapefile" all_water.shp gis_osm_water_a_free_1.shp
