@@ -97,8 +97,8 @@ jobs:
                       echo "========================================"
                       
                       # Download Geofabrik boundaries and water shapefile
-                      wget "https://download.geofabrik.de/${REGION}.poly" -O region.poly
-                      wget "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" -O region.shp.zip
+                      wget -nv "https://download.geofabrik.de/${REGION}.poly" -O region.poly
+                      wget -nv "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" -O region.shp.zip
                       
                       # The -o flag overwrites existing files from previous loop iterations
                       unzip -o region.shp.zip "gis_osm_water_a_free_1.*"
@@ -113,7 +113,7 @@ jobs:
 
                       # Generate Regional MBTiles
                       FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
-                      tippecanoe -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
+                      tippecanoe -q -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
                       
                       # Clean up workspace files to prepare for the next iteration
                       rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson
@@ -126,33 +126,27 @@ jobs:
                   path: "*.mbtiles"
                   retention-days: 1
 
-    # Job 3: Merge, extract MBTiles, and deploy
+    # Job 3: Merge MBTiles and convert directly to a single PMTiles file
     deploy-tiles:
         if: ${{ always() }}
         needs: build-tiles
         runs-on: ubuntu-latest
 
         steps:
-            # Clears out approx. 30GB+ of unneeded pre-cached tools before handling heavy file structures
-            - name: Free Disk Space
-              uses: jlumbroso/free-disk-space@v1.3.1
-              with:
-                  tool-cache: true
-                  android: true
-                  dotnet: true
-                  haskell: true
-                  large-packages: true
-                  docker-images: true
-                  swap-storage: true
-
             - name: Checkout Repository
               uses: actions/checkout@v4
 
-            - name: Install Tippecanoe (for tile-join)
+            - name: Install Tippecanoe & PMTiles CLI
               run: |
-                  sudo apt-get update && sudo apt-get install -y build-essential libsqlite3-dev zlib1g-dev
+                  sudo apt-get update && sudo apt-get install -y build-essential libsqlite3-dev zlib1g-dev wget
                   git clone --depth 1 https://github.com/felt/tippecanoe.git
                   cd tippecanoe && make -j$(nproc) && sudo make install
+                  cd ..
+                  
+                  # Download and install the PMTiles CLI tool
+                  wget https://github.com/protomaps/go-pmtiles/releases/download/v1.23.1/go-pmtiles_1.23.1_linux_amd64.tar.gz
+                  tar -xf go-pmtiles_1.23.1_linux_amd64.tar.gz
+                  sudo mv pmtiles /usr/local/bin/
 
             - name: Download All Generated MBTiles Batches
               uses: actions/download-artifact@v4
@@ -161,21 +155,23 @@ jobs:
                   path: download_mbtiles
                   merge-multiple: true
 
-            - name: Merge and Extract Tiles
+            - name: Merge and Convert to PMTiles
               run: |
-                  mkdir -p final_tiles_extracted
-                  tile-join \
-                    --no-tile-size-limit \
-                    -e final_tiles_extracted \
-                    --no-tile-compression \
-                    download_mbtiles/*.mbtiles
+                  mkdir -p deploy_folder
+                  
+                  # 1. Merge all separate regional MBTiles into one single consolidated MBTiles file
+                  tile-join -o combined.mbtiles download_mbtiles/*.mbtiles
+                  
+                  # 2. Convert the consolidated file directly into a single compressed .pmtiles file
+                  # This process extracts zero individual tile files, completely bypassing disk space and inode limits
+                  pmtiles convert combined.mbtiles deploy_folder/land.pmtiles
 
             - name: Deploy to GitHub Pages Branch
               uses: JamesIves/github-pages-deploy-action@v4
               with:
-                  folder: final_tiles_extracted
+                  folder: deploy_folder
                   target-folder: tiles/land
                   branch: gh-pages
-                  clean: ${{ github.event_name == 'schedule' || github.event.inputs.region == 'ALL_REGIONS' }}
-                  commit-message: "Deploy Consolidated Land Tiles 🚀"
+                  clean: true
+                  commit-message: "Deploy Consolidated PMTiles Archive 🚀"
                   single-commit: true
