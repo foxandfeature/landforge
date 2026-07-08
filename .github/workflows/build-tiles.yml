@@ -146,32 +146,39 @@ jobs:
                       # Convert Geofabrik .poly structure to a clean WKT string
                       python3 poly2wkt.py
 
-                      # Step 1: Clip the global ocean/sea polygons to this region's boundary.
-                      # -clipsrc uses the .qix spatial index, so only overlapping chunks of the
-                      # planet-wide file are read — this is fast even for the ~1 GB source file.
-                      ogr2ogr -f GeoJSON ocean_clip.geojson water-polygons/water_polygons.shp \
-                        -clipsrc "$(cat boundary.wkt)"
-
-                      # Step 2: Subtract BOTH inland water (rivers/lakes) AND the clipped ocean
-                      # from the boundary polygon in a single SQL pass.
-                      # VirtualOGR() works here because it references a GeoJSON file (not a
-                      # Shapefile directly in FROM), which avoids the CREATE VIRTUAL TABLE
-                      # limitation of the SQLite dialect.
-                      ogr2ogr -f GeoJSON land_layer.geojson gis_osm_water_a_free_1.shp \
+                      # Step 1: Subtract inland water (rivers/lakes) from the region boundary.
+                      ogr2ogr -f GeoJSON land_no_inland.geojson gis_osm_water_a_free_1.shp \
                         -dialect sqlite \
                         -sql "
-                            SELECT
-                            ST_MakeValid(
+                            SELECT ST_MakeValid(
                                 ST_Difference(
                                     ST_MakeValid(ST_GeomFromText('$(cat boundary.wkt)')),
                                     ST_MakeValid(ST_Union(ST_MakeValid(geometry)))
                                 )
                             ) AS geometry
-                            FROM (
-                                SELECT geometry FROM gis_osm_water_a_free_1
-                                UNION ALL
-                                SELECT geometry FROM VirtualOGR('ocean_clip.geojson')
-                            )
+                            FROM gis_osm_water_a_free_1
+                        "
+
+                      # Step 2: Clip the global ocean/sea polygons down to this region's extent.
+                      # -clipsrc uses the .qix spatial index so only the relevant tiles of the
+                      # planet-wide file are read.
+                      ogr2ogr -f GeoJSON ocean_clip.geojson water-polygons/water_polygons.shp \
+                        -clipsrc "$(cat boundary.wkt)"
+
+                      # Step 3: Subtract the clipped ocean from the inland-water-free result.
+                      # Both inputs are now plain GeoJSON files. We read land_no_inland.geojson's
+                      # single geometry as WKT via ogrinfo and pass it into the SQL expression.
+                      LAND_WKT=$(ogrinfo -al -geom=WKT land_no_inland.geojson | grep -m1 "^MULTIPOLYGON\|^POLYGON")
+                      ogr2ogr -f GeoJSON land_layer.geojson ocean_clip.geojson \
+                        -dialect sqlite \
+                        -sql "
+                            SELECT ST_MakeValid(
+                                ST_Difference(
+                                    ST_MakeValid(ST_GeomFromText('${LAND_WKT}')),
+                                    ST_MakeValid(ST_Union(ST_MakeValid(geometry)))
+                                )
+                            ) AS geometry
+                            FROM ocean_clip
                         "
 
                       # Generate Regional MBTiles
@@ -186,7 +193,7 @@ jobs:
                       echo "| \`$REGION\` | $ELAPSED_TIME |" >> $GITHUB_STEP_SUMMARY
                       
                       # Clean up workspace files to prepare for the next iteration
-                      rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt ocean_clip.geojson land_layer.geojson
+                      rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_no_inland.geojson ocean_clip.geojson land_layer.geojson
                   done
 
             - name: Upload Batch Artifact
