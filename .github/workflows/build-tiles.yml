@@ -91,16 +91,24 @@ jobs:
               run: |
                   REGIONS=$(echo '${{ toJSON(matrix.batch) }}' | jq -r '.[]')
 
+                  # Initialize a markdown table for the GitHub Step Summary to display metrics
+                  echo "### Region Processing Metrics (Batch ${{ strategy.job-index }})" >> $GITHUB_STEP_SUMMARY
+                  echo "| Region | Time (Seconds) |" >> $GITHUB_STEP_SUMMARY
+                  echo "|--------|----------------|" >> $GITHUB_STEP_SUMMARY
+
                   for REGION in $REGIONS; do
                       echo "========================================"
                       echo "Processing Region: $REGION"
                       echo "========================================"
                       
+                      # Record the start time of the current iteration
+                      START_TIME=$SECONDS
+                      
                       # Download Geofabrik boundaries and water shapefile
                       wget -nv "https://download.geofabrik.de/${REGION}.poly" -O region.poly
                       wget -nv "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" -O region.shp.zip
                       
-                      # The -o flag overwrites existing files from previous loop iterations
+                      # Overwrite existing files from previous loop iterations
                       unzip -o region.shp.zip "gis_osm_water_a_free_1.*"
                       
                       # Convert Geofabrik .poly structure to a clean WKT string
@@ -114,6 +122,13 @@ jobs:
                       # Generate Regional MBTiles
                       FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
                       tippecanoe -q -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
+                      
+                      # Calculate elapsed time and log it
+                      ELAPSED_TIME=$(( SECONDS - START_TIME ))
+                      echo "✅ Completed $REGION in $ELAPSED_TIME seconds."
+                      
+                      # Append the metric to the GitHub Step Summary table
+                      echo "| \`$REGION\` | $ELAPSED_TIME |" >> $GITHUB_STEP_SUMMARY
                       
                       # Clean up workspace files to prepare for the next iteration
                       rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson
