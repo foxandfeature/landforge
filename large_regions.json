@@ -1,8 +1,16 @@
 [
     "antarctica",
+    "australia-oceania/australia",
+    "europe/finland",
+    "europe/netherlands",
     "europe/norway/nord-norge",
     "europe/norway/ostlandet",
+    "europe/norway/trondelag",
+    "europe/norway/vestlandet",
     "europe/sweden",
     "north-america/canada/alberta",
-    "north-america/canada/manitoba"
+    "north-america/canada/british-columbia/north-admreg",
+    "north-america/canada/manitoba",
+    "north-america/us/alaska",
+    "north-america/us/florida"
 ]
