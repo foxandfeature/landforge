@@ -18,7 +18,7 @@ permissions:
     contents: write
 
 jobs:
-    # Job 1: Prepare matrix regions (Batched into chunks of 50 to bypass GitHub's 256 matrix limit)
+    # Job 1: Prepare matrix regions from both configuration files
     prepare:
         runs-on: ubuntu-latest
         outputs:
@@ -27,14 +27,21 @@ jobs:
             - name: Checkout Repository
               uses: actions/checkout@v4
 
-            - name: Load and Chunk Region List
+            - name: Load and Chunk Region Lists
               id: regions
               run: |
                   if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.region }}" = "ALL_REGIONS" ]; then
-                    # Split the regions array into sub-arrays
-                    echo "batches=$(jq -c '[_nwise(10)]' regions.json)" >> "$GITHUB_OUTPUT"
+                    # 1. Split standard regions into batches of 10
+                    STANDARD=$(jq -c '[_nwise(10)]' regions.json)
+                    
+                    # 2. Isolate large regions completely (each gets its own dedicated runner)
+                    LARGE=$(jq -c '[.[] | [.] ]' large_regions.json)
+                    
+                    # 3. Combine both lists together (LARGE first, then STANDARD)
+                    COMBINED=$(jq -c -n --argjson std "$STANDARD" --argjson lrg "$LARGE" '$lrg + $std')
+                    echo "batches=$COMBINED" >> "$GITHUB_OUTPUT"
                   else
-                    # For manual single-region runs, wrap the region into a single-item batch structure
+                    # For manual single-region runs, wrap the single region into a one-item batch structure
                     echo "batches=[[\"${{ github.event.inputs.region }}\"]]" >> "$GITHUB_OUTPUT"
                   fi
 
@@ -59,7 +66,6 @@ jobs:
                   cd tippecanoe && make -j$(nproc) && sudo make install
 
             - name: Create Python Helper Script
-              # Writing the script to a file avoids escaping issues with the EOF heredoc inside the Bash loop
               run: |
                   cat << 'EOF' > poly2wkt.py
                   import sys
@@ -83,7 +89,6 @@ jobs:
 
             - name: Process Region Data (Loop through Batch)
               run: |
-                  # Extract individual regions from the matrix batch JSON array
                   REGIONS=$(echo '${{ toJSON(matrix.batch) }}' | jq -r '.[]')
 
                   for REGION in $REGIONS; do
@@ -95,10 +100,10 @@ jobs:
                       wget "https://download.geofabrik.de/${REGION}.poly" -O region.poly
                       wget "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" -O region.shp.zip
                       
-                      # The -o flag overwrites files from previous loop iterations
+                      # The -o flag overwrites existing files from previous loop iterations
                       unzip -o region.shp.zip "gis_osm_water_a_free_1.*"
-
-                      # Convert Geofabrik .poly to a clean WKT string
+                      
+                      # Convert Geofabrik .poly structure to a clean WKT string
                       python3 poly2wkt.py
 
                       # Punch out water structures from the high-fidelity poly boundary
@@ -115,7 +120,6 @@ jobs:
                   done
 
             - name: Upload Batch Artifact
-              # Upload all .mbtiles generated in this batch together to reduce API overhead
               uses: actions/upload-artifact@v4
               with:
                   name: mbtiles-batch-${{ strategy.job-index }}
@@ -129,6 +133,18 @@ jobs:
         runs-on: ubuntu-latest
 
         steps:
+            # Clears out approx. 30GB+ of unneeded pre-cached tools before handling heavy file structures
+            - name: Free Disk Space
+              uses: jlumbroso/free-disk-space@v1.3.1
+              with:
+                  tool-cache: true
+                  android: true
+                  dotnet: true
+                  haskell: true
+                  large-packages: true
+                  docker-images: true
+                  swap-storage: true
+
             - name: Checkout Repository
               uses: actions/checkout@v4
 
