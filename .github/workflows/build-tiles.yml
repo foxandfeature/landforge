@@ -134,7 +134,7 @@ jobs:
 
               # Generate Regional MBTiles
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
-              tippecanoe -U=60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
+              tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
               
               # Calculate elapsed time and log it
               ELAPSED_TIME=$(( SECONDS - START_TIME ))
