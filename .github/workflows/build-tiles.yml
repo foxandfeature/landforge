@@ -36,28 +36,40 @@ jobs:
             echo "batches=[[\"${{ github.event.inputs.region }}\"]]" >> "$GITHUB_OUTPUT"
           fi
 
-  build-tiles:
-    needs: prepare
+  # Runs once, in parallel with "prepare", instead of inside every matrix job.
+  # Builds Tippecanoe from source a single time and downloads the global ocean
+  # dataset a single time, then caches both so the (up to 8 parallel) build-tiles
+  # jobs just restore them instead of re-downloading / re-compiling redundantly.
+  setup-tools:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 8
-      matrix:
-        batch: ${{ fromJSON(needs.prepare.outputs.batches) }}
-
+    outputs:
+      tippecanoe-key: ${{ steps.tc-version.outputs.key }}
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Install GDAL & Tippecanoe
+      - name: Determine Tippecanoe Cache Key
+        id: tc-version
         run: |
-          sudo apt-get update && sudo apt-get install -y gdal-bin sqlite3 build-essential libsqlite3-dev zlib1g-dev
+          HASH=$(git ls-remote https://github.com/felt/tippecanoe.git HEAD | cut -f1)
+          echo "key=tippecanoe-${HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Tippecanoe Binaries
+        id: cache-tippecanoe
+        uses: actions/cache@v4
+        with:
+          path: tippecanoe-bin
+          key: ${{ runner.os }}-${{ steps.tc-version.outputs.key }}
+
+      - name: Build Tippecanoe (Only on Cache Miss)
+        if: steps.cache-tippecanoe.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential libsqlite3-dev zlib1g-dev
           git clone --depth 1 https://github.com/felt/tippecanoe.git
-          cd tippecanoe && make -j$(nproc) && sudo make install
+          cd tippecanoe && make -j$(nproc)
+          mkdir -p ../tippecanoe-bin
+          cp tippecanoe tile-join ../tippecanoe-bin/
 
       - name: Get Current Month for Cache Key
         id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+        run: echo "month=$(date +'%Y-%m')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Global Ocean Data
         id: cache-ocean
@@ -70,9 +82,58 @@ jobs:
         if: steps.cache-ocean.outputs.cache-hit != 'true'
         run: |
           echo "Cache miss! Downloading OSM water polygons from web..."
-          wget -nv "https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip" -O ocean.zip
+          attempt=1
+          max_attempts=5
+          wait_seconds=15
+          until wget -nv "https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip" -O ocean.zip; do
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "❌ Failed to download ocean data after $attempt attempts."
+              exit 1
+            fi
+            echo "⚠️  Attempt $attempt/$max_attempts failed. Retrying in ${wait_seconds}s..."
+            sleep "$wait_seconds"
+            attempt=$((attempt + 1))
+            wait_seconds=$((wait_seconds * 2))
+          done
           unzip -q -o ocean.zip -d ocean_data
           rm ocean.zip
+
+  build-tiles:
+    needs: [prepare, setup-tools]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        batch: ${{ fromJSON(needs.prepare.outputs.batches) }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Restore Tippecanoe Binaries from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tippecanoe-bin
+          key: ${{ runner.os }}-${{ needs.setup-tools.outputs.tippecanoe-key }}
+          fail-on-cache-miss: true
+
+      - name: Install GDAL & Link Tippecanoe
+        run: |
+          sudo apt-get update && sudo apt-get install -y gdal-bin libsqlite3-0 zlib1g
+          sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
+          sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
+
+      - name: Get Current Month for Cache Key
+        id: date
+        run: echo "month=$(date +'%Y-%m')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Global Ocean Data from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ocean_data
+          key: ${{ runner.os }}-ocean-data-${{ steps.date.outputs.month }}
+          fail-on-cache-miss: true
 
       - name: Create Python Helper Script
         run: |
@@ -103,6 +164,27 @@ jobs:
           echo "| Region | Time (Seconds) |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|----------------|" >> $GITHUB_STEP_SUMMARY
 
+          # Downloads a URL with retries + exponential backoff, so a temporarily
+          # unreachable Geofabrik server doesn't fail the whole batch.
+          fetch_with_retry() {
+            local url="$1"
+            local output="$2"
+            local max_attempts=5
+            local wait_seconds=15
+            local attempt=1
+
+            until wget -nv "$url" -O "$output"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "❌ Giving up on $url after $attempt attempts."
+                return 1
+              fi
+              echo "⚠️  Attempt $attempt/$max_attempts for $url failed. Retrying in ${wait_seconds}s..."
+              sleep "$wait_seconds"
+              attempt=$((attempt + 1))
+              wait_seconds=$((wait_seconds * 2))
+            done
+          }
+
           for REGION in $REGIONS; do
               echo "========================================"
               echo "Processing Region: $REGION"
@@ -110,9 +192,9 @@ jobs:
               
               START_TIME=$SECONDS
               
-              # Download Geofabrik boundaries and inland water shapefile
-              wget -nv "https://download.geofabrik.de/${REGION}.poly" -O region.poly
-              wget -nv "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" -O region.shp.zip
+              # Download Geofabrik boundaries and inland water shapefile (with retry)
+              fetch_with_retry "https://download.geofabrik.de/${REGION}.poly" region.poly || exit 1
+              fetch_with_retry "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" region.shp.zip || exit 1
               
               # Extract only the water layer from Geofabrik zip
               unzip -q -o region.shp.zip "gis_osm_water_a_free_1.*"
@@ -154,20 +236,25 @@ jobs:
 
   deploy-tiles:
     if: ${{ always() }}
-    needs: build-tiles
+    needs: [build-tiles, setup-tools]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Tippecanoe & PMTiles CLI
+      - name: Restore Tippecanoe Binaries from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tippecanoe-bin
+          key: ${{ runner.os }}-${{ needs.setup-tools.outputs.tippecanoe-key }}
+          fail-on-cache-miss: true
+
+      - name: Install PMTiles CLI
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sudo apt-get update && sudo apt-get install -y build-essential libsqlite3-dev zlib1g-dev wget
-          git clone --depth 1 https://github.com/felt/tippecanoe.git
-          cd tippecanoe && make -j$(nproc) && sudo make install
-          cd ..
+          sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
+          sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
           gh release download v1.23.1 --repo protomaps/go-pmtiles --pattern "*linux*amd64*"
           tar -xf go-pmtiles_*
           sudo mv pmtiles /usr/local/bin/
