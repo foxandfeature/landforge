@@ -65,12 +65,24 @@ jobs:
           git clone --depth 1 https://github.com/felt/tippecanoe.git
           cd tippecanoe && make -j$(nproc) && sudo make install
 
-      - name: Download Global Ocean Data
+      - name: Get Current Month for Cache Key
+        id: date
+        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+      - name: Cache Global Ocean Data
+        id: cache-ocean
+        uses: actions/cache@v4
+        with:
+          path: ocean_data
+          key: ${{ runner.os }}-ocean-data-${{ steps.date.outputs.month }}
+
+      - name: Download Global Ocean Data (Only on Cache Miss)
+        if: steps.cache-ocean.outputs.cache-hit != 'true'
         run: |
-          # Download OSM water polygons (Ocean) once before iterating through the batch (WGS84 / EPSG:4326)
-          echo "Downloading OSM water polygons (Ocean)..."
+          echo "Cache miss! Downloading OSM water polygons from web..."
           wget -nv "https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip" -O ocean.zip
           unzip -q -o ocean.zip -d ocean_data
+          rm ocean.zip
 
       - name: Create Python Helper Script
         run: |
@@ -114,23 +126,36 @@ jobs:
               wget -nv "https://download.geofabrik.de/${REGION}.poly" -O region.poly
               wget -nv "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" -O region.shp.zip
               
-              # Overwrite existing files from previous loop iterations
+              # Extract only the water layer from Geofabrik zip
               unzip -q -o region.shp.zip "gis_osm_water_a_free_1.*"
               
               # Convert Geofabrik .poly structure to a clean WKT string
               python3 poly2wkt.py
+              WKT_BOUNDARY=$(cat boundary.wkt)
 
-              # 1. Clip the global ocean dataset using the inline WKT string string content
-              ogr2ogr -f "ESRI Shapefile" local_ocean.shp ocean_data/water-polygons-split-4326/water_polygons.shp -clipsrc "$(cat boundary.wkt)"
-
-              # 2. Combine inland water bodies and the clipped ocean dataset into a single shapefile
-              ogr2ogr -f "ESRI Shapefile" all_water.shp gis_osm_water_a_free_1.shp
-              ogr2ogr -f "ESRI Shapefile" -update -append all_water.shp local_ocean.shp -nln all_water
-
-              # 3. Punch out ALL water structures (Inland + Ocean) from the high-fidelity poly boundary
-              ogr2ogr -f GeoJSON land_layer.geojson all_water.shp \
+              # Executing the "All-in-One" spatial optimization sweep:
+              # This reads both datasets, clips the ocean data, and punches out all water structures 
+              # in-memory using SpatiaLite, completely avoiding slow intermediate shapefiles on disk.
+              ogr2ogr -f GeoJSON land_layer.geojson gis_osm_water_a_free_1.shp \
                 -dialect sqlite \
-                -sql "SELECT ST_Difference(ST_GeomFromText('$(cat boundary.wkt)'), ST_Union(ST_MakeValid(geometry))) AS geometry FROM all_water"
+                -sql "
+                  WITH combined_water AS (
+                    -- Step A: Select inland water bodies
+                    SELECT geometry FROM gis_osm_water_a_free_1
+                    UNION ALL
+                    -- Step B: Clip global ocean data directly on read using ST_Intersection and the WKT boundary
+                    SELECT ST_Intersection(o.geometry, ST_GeomFromText('$WKT_BOUNDARY')) AS geometry 
+                    FROM 'ocean_data/water-polygons-split-4326/water_polygons.shp'.water_polygons o
+                    WHERE ST_Intersects(o.geometry, ST_GeomFromText('$WKT_BOUNDARY'))
+                  )
+                  -- Step C: Collect all water layers and punch them out from the high-fidelity boundary poly
+                  -- ST_Collect is used instead of ST_Union to bypass slow topological merging
+                  SELECT ST_Difference(
+                    ST_GeomFromText('$WKT_BOUNDARY'), 
+                    ST_MakeValid(ST_Collect(geometry))
+                  ) AS geometry 
+                  FROM combined_water
+                "
 
               # Generate Regional MBTiles
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
@@ -143,8 +168,8 @@ jobs:
               # Append the metric to the GitHub Step Summary table
               echo "| \`$REGION\` | $ELAPSED_TIME |" >> $GITHUB_STEP_SUMMARY
               
-              # Clean up workspace files to prepare for the next iteration
-              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson local_ocean.* all_water.*
+              # Clean up workspace files to prepare for the next iteration (ocean_data remains untouched)
+              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson
           done
 
       - name: Upload Batch Artifact
@@ -164,15 +189,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Tippecanoe & PMTiles CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           sudo apt-get update && sudo apt-get install -y build-essential libsqlite3-dev zlib1g-dev wget
           git clone --depth 1 https://github.com/felt/tippecanoe.git
           cd tippecanoe && make -j$(nproc) && sudo make install
           cd ..
-          
-          # Download and install the PMTiles CLI tool
-          wget https://github.com/protomaps/go-pmtiles/releases/download/v1.23.1/go-pmtiles_1.23.1_linux_amd64.tar.gz
-          tar -xf go-pmtiles_1.23.1_linux_amd64.tar.gz
+
+          # Download the matching Linux AMD64 asset flexibly via GitHub CLI
+          gh release download v1.23.1 --repo protomaps/go-pmtiles --pattern "*linux*amd64*"
+
+          # Extract the downloaded archive (works for both .tar.gz and .tgz)
+          tar -xf go-pmtiles_*
           sudo mv pmtiles /usr/local/bin/
 
       - name: Download All Generated MBTiles Batches
@@ -185,12 +214,11 @@ jobs:
       - name: Merge and Convert to PMTiles
         run: |
           mkdir -p deploy_folder
-          
+
           # 1. Merge all separate regional MBTiles into one single consolidated MBTiles file
           tile-join -o combined.mbtiles download_mbtiles/*.mbtiles
-          
+
           # 2. Convert the consolidated file directly into a single compressed .pmtiles file
-          # This process extracts zero individual tile files, completely bypassing disk space and inode limits
           pmtiles convert combined.mbtiles deploy_folder/land.pmtiles
 
       - name: Deploy to GitHub Pages Branch
