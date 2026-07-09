@@ -133,9 +133,15 @@ jobs:
               python3 poly2wkt.py
               WKT_BOUNDARY=$(cat boundary.wkt)
 
-              # Executing the "All-in-One" spatial optimization sweep:
-              # This reads both datasets, clips the ocean data, and punches out all water structures 
-              # in-memory using SpatiaLite, completely avoiding slow intermediate shapefiles on disk.
+              echo "Pre-clipping global ocean data to region boundary..."
+              # Step 1: Pre-clip the massive global ocean data using GDAL's optimized native indexing.
+              # This drops the file down to a fraction of its size and prevents runner OOMs.
+              ogr2ogr -f "ESRI Shapefile" clipped_ocean.shp \
+                ocean_data/water-polygons-split-4326/water_polygons.shp \
+                -clipsrc boundary.wkt
+
+              echo "Executing spatial sweep optimization via SpatiaLite..."
+              # Step 2: Run the sweep against only the localized, pre-clipped ocean features
               ogr2ogr -f GeoJSON land_layer.geojson gis_osm_water_a_free_1.shp \
                 -dialect sqlite \
                 -sql "
@@ -143,13 +149,10 @@ jobs:
                     -- Step A: Select inland water bodies
                     SELECT geometry FROM gis_osm_water_a_free_1
                     UNION ALL
-                    -- Step B: Clip global ocean data directly on read using ST_Intersection and the WKT boundary
-                    SELECT ST_Intersection(o.geometry, ST_GeomFromText('$WKT_BOUNDARY')) AS geometry 
-                    FROM 'ocean_data/water-polygons-split-4326/water_polygons.shp'.water_polygons o
-                    WHERE ST_Intersects(o.geometry, ST_GeomFromText('$WKT_BOUNDARY'))
+                    -- Step B: Select pre-clipped local ocean water
+                    SELECT geometry FROM 'clipped_ocean.shp'.clipped_ocean
                   )
-                  -- Step C: Collect all water layers and punch them out from the high-fidelity boundary poly
-                  -- ST_Collect is used instead of ST_Union to bypass slow topological merging
+                  -- Step C: Collect all water layers and punch them out from the boundary poly
                   SELECT ST_Difference(
                     ST_GeomFromText('$WKT_BOUNDARY'), 
                     ST_MakeValid(ST_Collect(geometry))
@@ -168,8 +171,8 @@ jobs:
               # Append the metric to the GitHub Step Summary table
               echo "| \`$REGION\` | $ELAPSED_TIME |" >> $GITHUB_STEP_SUMMARY
               
-              # Clean up workspace files to prepare for the next iteration (ocean_data remains untouched)
-              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson
+              # Clean up workspace files to prepare for the next iteration
+              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson clipped_ocean.*
           done
 
       - name: Upload Batch Artifact
