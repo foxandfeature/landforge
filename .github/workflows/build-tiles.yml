@@ -209,7 +209,7 @@ jobs:
                       FROM local_land"
 
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
-              tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
+              tippecanoe -P -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
               
               ELAPSED_TIME=$(( SECONDS - START_TIME ))
               echo "✅ Completed $REGION in $ELAPSED_TIME seconds."
