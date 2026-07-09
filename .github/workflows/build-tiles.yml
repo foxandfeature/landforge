@@ -120,20 +120,19 @@ jobs:
               # Convert Geofabrik .poly structure to a clean WKT string
               python3 poly2wkt.py
 
-              echo "1. Clipping global ocean dataset using boundary WKT..."
-              ogr2ogr -f "GPKG" local_ocean.gpkg ocean_data/water-polygons-split-4326/water_polygons.shp -clipsrc boundary.wkt
+              echo "1. Clipping global ocean dataset using inline WKT..."
+              ogr2ogr -f "ESRI Shapefile" local_ocean.shp ocean_data/water-polygons-split-4326/water_polygons.shp -clipsrc "$(cat boundary.wkt)"
 
-              echo "2. Combining inland water bodies and the clipped ocean dataset into a single GeoPackage..."
-              ogr2ogr -f "GPKG" all_water.gpkg gis_osm_water_a_free_1.shp -nln all_water
-              ogr2ogr -f "GPKG" -update -append all_water.gpkg local_ocean.gpkg -nln all_water
+              echo "2. Combining inland water bodies and the clipped ocean dataset..."
+              ogr2ogr -f "ESRI Shapefile" all_water.shp gis_osm_water_a_free_1.shp
+              ogr2ogr -f "ESRI Shapefile" -update -append all_water.shp local_ocean.shp -nln all_water
 
-              echo "3. Converting boundary WKT to a solid base layer..."
-              ogr2ogr -f "GPKG" boundary.gpkg boundary.wkt -nln boundary
+              echo "3. Punching out ALL water structures from boundary..."
+              ogr2ogr -f GeoJSON land_layer.geojson all_water.shp \
+                -dialect sqlite \
+                -sql "SELECT ST_Difference(ST_GeomFromText('$(cat boundary.wkt)'), ST_Union(ST_MakeValid(geometry))) AS geometry FROM all_water"
 
-              echo "4. Punching out ALL water structures from boundary via Native Erase..."
-              ogr2ogr -f GeoJSON land_layer.geojson boundary.gpkg -erase all_water.gpkg
-
-              # Generate Regional MBTiles (with -P for parallel multi-core processing)
+              # Generate Regional MBTiles
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
               tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
               
@@ -142,8 +141,8 @@ jobs:
               
               echo "| \`$REGION\` | $ELAPSED_TIME |" >> $GITHUB_STEP_SUMMARY
               
-              # Clean up workspace variables for the next iteration
-              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt boundary.gpkg land_layer.geojson local_ocean.gpkg all_water.gpkg
+              # Clean up workspace
+              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson local_ocean.* all_water.*
           done
 
       - name: Upload Batch Artifact
