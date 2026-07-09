@@ -1,3 +1,5 @@
+name: Build and Deploy Land Tiles
+
 on:
   schedule:
     - cron: "0 0 1 * *"
@@ -28,7 +30,7 @@ jobs:
         id: regions
         run: |
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.region }}" = "ALL_REGIONS" ]; then
-            STANDARD=$(jq -c '[_nwise(10)]' regions.json)
+            STANDARD=$(jq -c '[_nwise(20)]' regions.json)
             LARGE=$(jq -c '[.[] | [.] ]' large_regions.json)
             COMBINED=$(jq -c -n --argjson std "$STANDARD" --argjson lrg "$LARGE" '$lrg + $std')
             echo "batches=$COMBINED" >> "$GITHUB_OUTPUT"
@@ -36,10 +38,6 @@ jobs:
             echo "batches=[[\"${{ github.event.inputs.region }}\"]]" >> "$GITHUB_OUTPUT"
           fi
 
-  # Runs once, in parallel with "prepare", instead of inside every matrix job.
-  # Builds Tippecanoe from source a single time and downloads the global ocean
-  # dataset a single time, then caches both so the (up to 8 parallel) build-tiles
-  # jobs just restore them instead of re-downloading / re-compiling redundantly.
   setup-tools:
     runs-on: ubuntu-latest
     outputs:
@@ -71,23 +69,23 @@ jobs:
         id: date
         run: echo "month=$(date +'%Y-%m')" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Global Ocean Data
-        id: cache-ocean
+      - name: Cache Global Land Data
+        id: cache-land
         uses: actions/cache@v4
         with:
-          path: ocean_data
-          key: ${{ runner.os }}-ocean-data-${{ steps.date.outputs.month }}
+          path: land_data
+          key: ${{ runner.os }}-land-data-${{ steps.date.outputs.month }}
 
-      - name: Download Global Ocean Data (Only on Cache Miss)
-        if: steps.cache-ocean.outputs.cache-hit != 'true'
+      - name: Download Global Land Data (Only on Cache Miss)
+        if: steps.cache-land.outputs.cache-hit != 'true'
         run: |
-          echo "Cache miss! Downloading OSM water polygons from web..."
+          echo "Cache miss! Downloading OSM land polygons from web..."
           attempt=1
           max_attempts=5
           wait_seconds=15
-          until wget -nv "https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip" -O ocean.zip; do
+          until wget -nv "https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip" -O land.zip; do
             if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "❌ Failed to download ocean data after $attempt attempts."
+              echo "❌ Failed to download land data after $attempt attempts."
               exit 1
             fi
             echo "⚠️  Attempt $attempt/$max_attempts failed. Retrying in ${wait_seconds}s..."
@@ -95,15 +93,14 @@ jobs:
             attempt=$((attempt + 1))
             wait_seconds=$((wait_seconds * 2))
           done
-          unzip -q -o ocean.zip -d ocean_data
-          rm ocean.zip
+          unzip -q -o land.zip -d land_data
+          rm land.zip
 
   build-tiles:
     needs: [prepare, setup-tools]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 8
       matrix:
         batch: ${{ fromJSON(needs.prepare.outputs.batches) }}
 
@@ -128,11 +125,11 @@ jobs:
         id: date
         run: echo "month=$(date +'%Y-%m')" >> "$GITHUB_OUTPUT"
 
-      - name: Restore Global Ocean Data from Cache
+      - name: Restore Global Land Data from Cache
         uses: actions/cache/restore@v4
         with:
-          path: ocean_data
-          key: ${{ runner.os }}-ocean-data-${{ steps.date.outputs.month }}
+          path: land_data
+          key: ${{ runner.os }}-land-data-${{ steps.date.outputs.month }}
           fail-on-cache-miss: true
 
       - name: Create Python Helper Script
@@ -164,8 +161,6 @@ jobs:
           echo "| Region | Time (Seconds) |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|----------------|" >> $GITHUB_STEP_SUMMARY
 
-          # Downloads a URL with retries + exponential backoff, so a temporarily
-          # unreachable Geofabrik server doesn't fail the whole batch.
           fetch_with_retry() {
             local url="$1"
             local output="$2"
@@ -192,29 +187,27 @@ jobs:
               
               START_TIME=$SECONDS
               
-              # Download Geofabrik boundaries and inland water shapefile (with retry)
               fetch_with_retry "https://download.geofabrik.de/${REGION}.poly" region.poly || exit 1
               fetch_with_retry "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" region.shp.zip || exit 1
               
-              # Extract only the water layer from Geofabrik zip
               unzip -q -o region.shp.zip "gis_osm_water_a_free_1.*"
-              
-              # Convert Geofabrik .poly structure to a clean WKT string
               python3 poly2wkt.py
 
-              echo "1. Clipping global ocean dataset using inline WKT..."
-              ogr2ogr -f "ESRI Shapefile" local_ocean.shp ocean_data/water-polygons-split-4326/water_polygons.shp -clipsrc "$(cat boundary.wkt)"
+              echo "1. Clipping global land polygons to the boundary..."
+              ogr2ogr -f "ESRI Shapefile" local_land.shp \
+                land_data/land-polygons-split-4326/land_polygons.shp \
+                -clipsrc "$(cat boundary.wkt)" \
+                -makevalid
 
-              echo "2. Combining inland water bodies and the clipped ocean dataset..."
-              ogr2ogr -f "ESRI Shapefile" all_water.shp gis_osm_water_a_free_1.shp
-              ogr2ogr -f "ESRI Shapefile" -update -append all_water.shp local_ocean.shp -nln all_water
-
-              echo "3. Punching out ALL water structures from boundary..."
-              ogr2ogr -f GeoJSON land_layer.geojson all_water.shp \
+              echo "2. Punching inland water out of the clipped land..."
+              ogr2ogr -f GeoJSON land_layer.geojson local_land.shp \
+                --config OGR_SQLITE_CACHE 1024 \
                 -dialect sqlite \
-                -sql "SELECT ST_Difference(ST_GeomFromText('$(cat boundary.wkt)'), ST_Union(ST_MakeValid(geometry))) AS geometry FROM all_water"
+                -sql "SELECT ST_Difference(ST_Union(geometry), \
+                      (SELECT ST_Union(ST_MakeValid(geometry)) \
+                       FROM 'gis_osm_water_a_free_1.shp'.gis_osm_water_a_free_1)) AS geometry \
+                      FROM local_land"
 
-              # Generate Regional MBTiles
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
               tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
               
@@ -223,8 +216,7 @@ jobs:
               
               echo "| \`$REGION\` | $ELAPSED_TIME |" >> $GITHUB_STEP_SUMMARY
               
-              # Clean up workspace
-              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson local_ocean.* all_water.*
+              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson local_land.*
           done
 
       - name: Upload Batch Artifact

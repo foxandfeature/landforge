@@ -1,19 +1,17 @@
 [
+    "africa/cameroon",
+    "africa/ghana",
+    "africa/mozambique",
+    "africa/nigeria",
     "antarctica",
     "asia/bangladesh",
-    "asia/philippines",
-    "asia/thailand",
+    "asia/japan/kyushu",
     "europe/denmark",
     "europe/finland",
     "europe/norway/nord-norge",
     "europe/norway/ostlandet",
     "europe/norway/trondelag",
     "europe/norway/vestlandet",
-    "europe/germany/hessen",
-    "europe/germany/niedersachsen",
-    "europe/germany/rheinland-pfalz",
-    "europe/greece",
-    "europe/italy/centro",
     "europe/italy/nord-est",
     "europe/sweden",
     "north-america/canada/alberta",
@@ -21,6 +19,5 @@
     "north-america/canada/manitoba",
     "north-america/canada/quebec",
     "north-america/us/alaska",
-    "north-america/us/florida",
-    "north-america/us/georgia"
+    "north-america/us/florida"
 ]
