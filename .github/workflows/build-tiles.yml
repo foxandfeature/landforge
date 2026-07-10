@@ -286,7 +286,7 @@ jobs:
         run: |
           mkdir -p deploy_folder
           # Reads individual MBTiles files from the correct folder and merges them directly into a PMTiles archive
-          tile-join -U 60 -o deploy_folder/land.pmtiles download_mbtiles/*.mbtiles
+          tile-join -o deploy_folder/land.pmtiles download_mbtiles/*.mbtiles
 
       - name: Deploy to GitHub Pages Branch
         uses: JamesIves/github-pages-deploy-action@v4
