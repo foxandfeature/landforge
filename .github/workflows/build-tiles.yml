@@ -2,7 +2,7 @@ name: Build and Deploy Land Tiles
 
 on:
   schedule:
-    - cron: "0 0 1 * *"
+    - cron: "0 0 1 * *" # Runs automatically on the 1st of every month
   workflow_dispatch:
     inputs:
       region:
@@ -29,6 +29,7 @@ jobs:
       - name: Load and Chunk Region Lists
         id: regions
         run: |
+          # Split automated schedules or global builds into optimized processing chunks
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.region }}" = "ALL_REGIONS" ]; then
             STANDARD=$(jq -c '[_nwise(20)]' regions.json)
             LARGE=$(jq -c '[.[] | [.] ]' large_regions.json)
@@ -46,6 +47,7 @@ jobs:
       - name: Determine Tippecanoe Cache Key
         id: tc-version
         run: |
+          # Generate a deterministic cache key using Tippecanoe's latest commit hash
           HASH=$(git ls-remote https://github.com/felt/tippecanoe.git HEAD | cut -f1)
           echo "key=tippecanoe-${HASH}" >> "$GITHUB_OUTPUT"
 
@@ -139,22 +141,27 @@ jobs:
           import sys
           polygons = []
           current = []
+          # Read and parse Geofabrik .poly format lines into coordinates
           with open('region.poly') as f:
               for line in f.readlines()[1:]:
                   line = line.strip()
                   if not line or line == 'END':
                       if current:
+                          # Close the polygon loop if required
                           if current[0] != current[-1]: current.append(current[0])
                           polygons.append(f"(({','.join(current)}))")
                           current = []
                       continue
                   p = line.split()
                   if len(p) == 2: current.append(f"{p[0]} {p[1]}")
+          # Format structures cleanly into a single valid WKT geometry string
           wkt = f"MULTIPOLYGON({','.join(polygons)})" if len(polygons) > 1 else f"POLYGON{polygons[0]}"
           with open('boundary.wkt', 'w') as out: out.write(wkt)
           EOF
 
       - name: Process Region Data (Loop through Batch)
+        env:
+          NODE_OPTIONS: "--max-old-space-size=6144"
         run: |
           REGIONS=$(echo '${{ toJSON(matrix.batch) }}' | jq -r '.[]')
 
@@ -195,23 +202,28 @@ jobs:
               python3 poly2wkt.py
 
               echo "1. Clipping global land polygons to the boundary..."
+              # ogr2ogr filters global land polygons on disk to keep RAM usage low
               ogr2ogr -f "ESRI Shapefile" local_land.shp \
                 land_data/land-polygons-split-4326/land_polygons.shp \
                 -clipsrc "$(cat boundary.wkt)" \
                 -makevalid
 
               echo "2. Punching inland water out of the clipped land (via Mapshaper)..."
-              mapshaper local_land.shp -erase gis_osm_water_a_free_1.shp -o land_layer.geojson
+              # Exporting directly to .ndjson allows Mapshaper to stream features to disk line-by-line
+              mapshaper local_land.shp -erase gis_osm_water_a_free_1.shp -o land_layer.ndjson
 
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
-              tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
+              echo "3. Building vector tiles with parallel execution..."
+              # The '-P' flag enables parallel multi-threaded parsing on Newline-Delimited JSON inputs
+              tippecanoe -P -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.ndjson
               
               ELAPSED_TIME=$(( SECONDS - START_TIME ))
               echo "✅ Completed $REGION in $ELAPSED_TIME seconds."
               
               echo "| \`$REGION\` | $ELAPSED_TIME |" >> $GITHUB_STEP_SUMMARY
               
-              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.geojson local_land.*
+              # Clear temporary space to prevent running out of disk storage across batch loops
+              rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.ndjson local_land.*
           done
 
       - name: Upload Batch Artifact
@@ -242,9 +254,6 @@ jobs:
         run: |
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
-          gh release download --repo protomaps/go-pmtiles --pattern "*Linux_x86_64*"
-          tar -xf go-pmtiles_*
-          sudo mv pmtiles /usr/local/bin/
 
       - name: Download All Generated MBTiles Batches
         uses: actions/download-artifact@v4
@@ -256,8 +265,7 @@ jobs:
       - name: Merge and Convert to PMTiles
         run: |
           mkdir -p deploy_folder
-          tile-join -o combined.mbtiles download_mbtiles/*.mbtiles
-          pmtiles convert combined.mbtiles deploy_folder/land.pmtiles
+          tile-join -o deploy_folder/land.pmtiles download_pmtiles/*.pmtiles
 
       - name: Deploy to GitHub Pages Branch
         uses: JamesIves/github-pages-deploy-action@v4
