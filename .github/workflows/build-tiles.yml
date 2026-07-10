@@ -13,6 +13,10 @@ on:
         options:
           - "ALL_REGIONS"
           - "europe/germany/niedersachsen"
+      debug_run_id:
+        description: "DEBUG: Run ID to download existing artifacts (skips tile generation)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -99,6 +103,8 @@ jobs:
           rm land.zip
 
   build-tiles:
+    # Skip this heavy job entirely if a debug run ID is provided
+    if: ${{ github.event.inputs.debug_run_id == '' }}
     needs: [prepare, setup-tools]
     runs-on: ubuntu-latest
     strategy:
@@ -209,12 +215,10 @@ jobs:
                 -makevalid
 
               echo "2. Punching inland water out of the clipped land (via Mapshaper)..."
-              # Exporting directly to .ndjson allows Mapshaper to stream features to disk line-by-line
               mapshaper local_land.shp -erase gis_osm_water_a_free_1.shp -o land_layer.ndjson
 
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
               echo "3. Building vector tiles with parallel execution..."
-              # The '-P' flag enables parallel multi-threaded parsing on Newline-Delimited JSON inputs
               tippecanoe -P -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.ndjson
               
               ELAPSED_TIME=$(( SECONDS - START_TIME ))
@@ -234,7 +238,8 @@ jobs:
           retention-days: 1
 
   deploy-tiles:
-    if: ${{ always() }}
+    # Ensure this runs even if the build-tiles job was conditionally skipped
+    if: ${{ !failure() && !cancelled() }}
     needs: [build-tiles, setup-tools]
     runs-on: ubuntu-latest
     steps:
@@ -255,17 +260,33 @@ jobs:
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
-      - name: Download All Generated MBTiles Batches
+      # --- ARTIFACT DOWNLOAD CONFIGURATION ---
+
+      - name: Download MBTiles (Standard Workflow Execution)
+        if: ${{ github.event.inputs.debug_run_id == '' }}
         uses: actions/download-artifact@v4
         with:
           pattern: mbtiles-batch-*
           path: download_mbtiles
           merge-multiple: true
 
+      - name: Download MBTiles (DEBUG Mode - Targets Older Workflow Run)
+        if: ${{ github.event.inputs.debug_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mbtiles-batch-*
+          path: download_mbtiles
+          merge-multiple: true
+          run-id: ${{ github.event.inputs.debug_run_id }}
+          github-token: ${{ github.token }} # Required to pull artifacts across different run boundaries
+
+      # --- PROCESSING & DEPLOYMENT ---
+
       - name: Merge and Convert to PMTiles
         run: |
           mkdir -p deploy_folder
-          tile-join -o deploy_folder/land.pmtiles download_pmtiles/*.pmtiles
+          # Reads individual MBTiles files from the correct folder and merges them directly into a PMTiles archive
+          tile-join -U 60 -o deploy_folder/land.pmtiles download_mbtiles/*.mbtiles
 
       - name: Deploy to GitHub Pages Branch
         uses: JamesIves/github-pages-deploy-action@v4
