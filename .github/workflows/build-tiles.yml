@@ -163,17 +163,15 @@ jobs:
           land = gpd.read_file("local_land.shp", engine="pyogrio")
           water = gpd.read_file("gis_osm_water_a_free_1.shp", engine="pyogrio")
 
-          land_geoms = shapely.make_valid(land.geometry.values)
-          water_geoms = shapely.make_valid(water.geometry.values)
+          land.geometry = shapely.make_valid(land.geometry.values)
+          water.geometry = shapely.make_valid(water.geometry.values)
 
-          land_union = shapely.union_all(land_geoms)
-          water_union = shapely.union_all(water_geoms)
+          # Spatial-index based difference instead of union_all() + difference() —
+          # avoids dissolving thousands of islands/fjords into one polygon before
+          # subtracting water, which is what was hanging on Nord-Norge.
+          result = gpd.overlay(land, water, how="difference", keep_geom_type=True)
 
-          result = land_union.difference(water_union)
-
-          gpd.GeoDataFrame(geometry=[result], crs=land.crs).to_file(
-              "land_layer.geojson", driver="GeoJSON"
-          )
+          result[["geometry"]].to_file("land_layer.geojson", driver="GeoJSON")
           EOF
 
       - name: Process Region Data (Loop through Batch)
