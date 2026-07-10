@@ -115,14 +115,12 @@ jobs:
           key: ${{ runner.os }}-${{ needs.setup-tools.outputs.tippecanoe-key }}
           fail-on-cache-miss: true
 
-      - name: Install GDAL & Link Tippecanoe
+      - name: Install GDAL, Mapshaper & Link Tippecanoe
         run: |
-          sudo apt-get update && sudo apt-get install -y gdal-bin libsqlite3-0 zlib1g
+          sudo apt-get update && sudo apt-get install -y gdal-bin libsqlite3-0 zlib1g nodejs npm
+          sudo npm install -g mapshaper
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
-
-      - name: Install Python Geometry Dependencies
-        run: pip install --break-system-packages --quiet "shapely>=2.0" geopandas pyogrio
 
       - name: Get Current Month for Cache Key
         id: date
@@ -154,24 +152,6 @@ jobs:
                   if len(p) == 2: current.append(f"{p[0]} {p[1]}")
           wkt = f"MULTIPOLYGON({','.join(polygons)})" if len(polygons) > 1 else f"POLYGON{polygons[0]}"
           with open('boundary.wkt', 'w') as out: out.write(wkt)
-          EOF
-
-          cat << 'EOF' > punch_holes.py
-          import geopandas as gpd
-          import shapely
-
-          land = gpd.read_file("local_land.shp", engine="pyogrio")
-          water = gpd.read_file("gis_osm_water_a_free_1.shp", engine="pyogrio")
-
-          land.geometry = shapely.make_valid(land.geometry.values)
-          water.geometry = shapely.make_valid(water.geometry.values)
-
-          # Spatial-index based difference instead of union_all() + difference() —
-          # avoids dissolving thousands of islands/fjords into one polygon before
-          # subtracting water, which is what was hanging on Nord-Norge.
-          result = gpd.overlay(land, water, how="difference", keep_geom_type=True)
-
-          result[["geometry"]].to_file("land_layer.geojson", driver="GeoJSON")
           EOF
 
       - name: Process Region Data (Loop through Batch)
@@ -220,8 +200,8 @@ jobs:
                 -clipsrc "$(cat boundary.wkt)" \
                 -makevalid
 
-              echo "2. Punching inland water out of the clipped land..."
-              python3 punch_holes.py
+              echo "2. Punching inland water out of the clipped land (via Mapshaper)..."
+              mapshaper local_land.shp -erase gis_osm_water_a_free_1.shp -o land_layer.geojson
 
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
               tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
