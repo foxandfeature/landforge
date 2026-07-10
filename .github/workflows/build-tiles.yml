@@ -254,20 +254,18 @@ jobs:
           fail-on-cache-miss: true
 
       - name: Install PMTiles CLI
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
-      # --- ARTIFACT DOWNLOAD CONFIGURATION ---
+      # --- ARTIFACT DOWNLOAD CONFIGURATION (TARGETING RAM DISK) ---
 
       - name: Download MBTiles (Standard Workflow Execution)
         if: ${{ github.event.inputs.debug_run_id == '' }}
         uses: actions/download-artifact@v4
         with:
           pattern: mbtiles-batch-*
-          path: download_mbtiles
+          path: /dev/shm/download_mbtiles
           merge-multiple: true
 
       - name: Download MBTiles (DEBUG Mode - Targets Older Workflow Run)
@@ -275,18 +273,23 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: mbtiles-batch-*
-          path: download_mbtiles
+          path: /dev/shm/download_mbtiles
           merge-multiple: true
           run-id: ${{ github.event.inputs.debug_run_id }}
-          github-token: ${{ github.token }} # Required to pull artifacts across different run boundaries
+          github-token: ${{ github.token }}
 
       # --- PROCESSING & DEPLOYMENT ---
 
       - name: Merge and Convert to PMTiles
         run: |
+          mkdir -p /dev/shm/deploy_folder
+          
+          # -pk bypasses tile size verification for maximum speed
+          tile-join -pk -o /dev/shm/deploy_folder/land.pmtiles /dev/shm/download_mbtiles/*.mbtiles
+          
+          # Move the final output back to your workspace for the deployment action
           mkdir -p deploy_folder
-          # Reads individual MBTiles files from the correct folder and merges them directly into a PMTiles archive
-          tile-join -o deploy_folder/land.pmtiles download_mbtiles/*.mbtiles
+          mv /dev/shm/deploy_folder/land.pmtiles deploy_folder/
 
       - name: Deploy to GitHub Pages Branch
         uses: JamesIves/github-pages-deploy-action@v4
