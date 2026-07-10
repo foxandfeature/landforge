@@ -19,7 +19,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   prepare:
@@ -116,19 +116,15 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Restore Tippecanoe Binaries from Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: tippecanoe-bin
-          key: ${{ runner.os }}-${{ needs.setup-tools.outputs.tippecanoe-key }}
-          fail-on-cache-miss: true
+      # NOTE: Tippecanoe is no longer needed in this job. Tiling now happens
+      # exactly once, globally, in deploy-tiles - this job only fetches,
+      # clips and erases geometry, which is where the parallelism actually
+      # helps.
 
-      - name: Install GDAL, Mapshaper & Link Tippecanoe
+      - name: Install GDAL & Mapshaper
         run: |
-          sudo apt-get update && sudo apt-get install -y gdal-bin libsqlite3-0 zlib1g nodejs npm
+          sudo apt-get update && sudo apt-get install -y gdal-bin nodejs npm
           sudo npm install -g mapshaper
-          sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
-          sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
       - name: Get Current Month for Cache Key
         id: date
@@ -217,9 +213,14 @@ jobs:
               echo "2. Punching inland water out of the clipped land (via Mapshaper)..."
               mapshaper local_land.shp -erase gis_osm_water_a_free_1.shp -o land_layer.ndjson
 
-              FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
-              echo "3. Building vector tiles with parallel execution..."
-              tippecanoe -P -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.ndjson
+              # Instead of tiling this region on its own, keep the raw erased
+              # geometry and compress it. Tiling happens once for the whole
+              # world in deploy-tiles - this avoids both the final tile-join
+              # fan-in bottleneck AND inconsistent --drop-densest-as-needed
+              # decisions across neighbouring regions.
+              FILENAME=$(echo "${REGION}" | tr '/' '-').ndjson.gz
+              echo "3. Compressing erased land geometry for later global tiling..."
+              gzip -c land_layer.ndjson > "$FILENAME"
               
               ELAPSED_TIME=$(( SECONDS - START_TIME ))
               echo "✅ Completed $REGION in $ELAPSED_TIME seconds."
@@ -233,8 +234,8 @@ jobs:
       - name: Upload Batch Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mbtiles-batch-${{ strategy.job-index }}
-          path: "*.mbtiles"
+          name: land-ndjson-batch-${{ strategy.job-index }}
+          path: "*.ndjson.gz"
           retention-days: 1
 
   deploy-tiles:
@@ -253,47 +254,72 @@ jobs:
           key: ${{ runner.os }}-${{ needs.setup-tools.outputs.tippecanoe-key }}
           fail-on-cache-miss: true
 
-      - name: Install PMTiles CLI
+      - name: Install Tippecanoe
         run: |
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
       # --- ARTIFACT DOWNLOAD CONFIGURATION (ZURÜCK AUF DIE FESTPLATTE) ---
 
-      - name: Download MBTiles (Standard Workflow Execution)
+      - name: Download Land Geometry (Standard Workflow Execution)
         if: ${{ github.event.inputs.debug_run_id == '' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: mbtiles-batch-*
-          path: download_mbtiles
+          pattern: land-ndjson-batch-*
+          path: download_ndjson
           merge-multiple: true
 
-      - name: Download MBTiles (DEBUG Mode - Targets Older Workflow Run)
+      - name: Download Land Geometry (DEBUG Mode - Targets Older Workflow Run)
         if: ${{ github.event.inputs.debug_run_id != '' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: mbtiles-batch-*
-          path: download_mbtiles
+          pattern: land-ndjson-batch-*
+          path: download_ndjson
           merge-multiple: true
           run-id: ${{ github.event.inputs.debug_run_id }}
           github-token: ${{ github.token }}
 
       # --- PROCESSING & DEPLOYMENT ---
+      # Single global tiling pass: concatenating ndjson is cheap (no tile
+      # decode/re-encode like tile-join needed to do across hundreds of
+      # per-region mbtiles). tippecanoe writes .pmtiles directly (v2.17+),
+      # so tile-join isn't needed here at all anymore.
 
-      - name: Merge and Convert to PMTiles
+      - name: Combine Regions and Build Global Tileset (Single Pass)
         run: |
           mkdir -p deploy_folder
 
-          # -pk verhindert das CPU-intensive Validieren. 
-          # Das Schreiben auf die SSD ist hier sicher, da der Flaschenhals die CPU war.
-          tile-join -pk -o deploy_folder/land.pmtiles download_mbtiles/*.mbtiles
+          echo "1. Decompressing & concatenating all regions into one global stream..."
+          zcat download_ndjson/*.ndjson.gz > world_land.ndjson
 
-      - name: Deploy to GitHub Pages Branch
-        uses: JamesIves/github-pages-deploy-action@v4
+          echo "2. Building vector tiles once for the whole world..."
+          tippecanoe -P -U 60 --force \
+            -o deploy_folder/land.pmtiles \
+            -l land -z 14 -Z 0 --drop-densest-as-needed \
+            world_land.ndjson
+
+          echo "Final size:"
+          ls -lh deploy_folder/land.pmtiles
+
+      # NOTE: Deployment to gh-pages via git is disabled for now - the
+      # merged land.pmtiles is likely to exceed GitHub's ~100MB per-file
+      # limit for repo commits. Instead we publish it as a workflow
+      # artifact (no git size limit here, only storage-plan quotas), which
+      # can be downloaded and pushed elsewhere (e.g. an S3/R2 bucket) as a
+      # separate step once you've decided on final hosting.
+      - name: Upload PMTiles Artifact
+        uses: actions/upload-artifact@v4
         with:
-          folder: deploy_folder
-          target-folder: tiles/land
-          branch: gh-pages
-          clean: true
-          commit-message: "Deploy Consolidated PMTiles Archive 🚀"
-          single-commit: true
+          name: land-pmtiles
+          path: deploy_folder/land.pmtiles
+          retention-days: 14
+
+      # - name: Deploy to GitHub Pages Branch
+      #   uses: JamesIves/github-pages-deploy-action@v4
+      #   with:
+      #     folder: deploy_folder
+      #     target-folder: tiles/land
+      #     branch: gh-pages
+      #     clean: true
+      #     commit-message: "Deploy Consolidated PMTiles Archive 🚀"
+      #     single-commit: true
