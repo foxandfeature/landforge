@@ -121,6 +121,9 @@ jobs:
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
+      - name: Install Python Geometry Dependencies
+        run: pip install --break-system-packages --quiet "shapely>=2.0" geopandas pyogrio
+
       - name: Get Current Month for Cache Key
         id: date
         run: echo "month=$(date +'%Y-%m')" >> "$GITHUB_OUTPUT"
@@ -151,6 +154,26 @@ jobs:
                   if len(p) == 2: current.append(f"{p[0]} {p[1]}")
           wkt = f"MULTIPOLYGON({','.join(polygons)})" if len(polygons) > 1 else f"POLYGON{polygons[0]}"
           with open('boundary.wkt', 'w') as out: out.write(wkt)
+          EOF
+
+          cat << 'EOF' > punch_holes.py
+          import geopandas as gpd
+          import shapely
+
+          land = gpd.read_file("local_land.shp", engine="pyogrio")
+          water = gpd.read_file("gis_osm_water_a_free_1.shp", engine="pyogrio")
+
+          land_geoms = shapely.make_valid(land.geometry.values)
+          water_geoms = shapely.make_valid(water.geometry.values)
+
+          land_union = shapely.union_all(land_geoms)
+          water_union = shapely.union_all(water_geoms)
+
+          result = land_union.difference(water_union)
+
+          gpd.GeoDataFrame(geometry=[result], crs=land.crs).to_file(
+              "land_layer.geojson", driver="GeoJSON"
+          )
           EOF
 
       - name: Process Region Data (Loop through Batch)
@@ -200,16 +223,7 @@ jobs:
                 -makevalid
 
               echo "2. Punching inland water out of the clipped land..."
-              ogr2ogr -f GeoJSON land_layer.geojson local_land.shp \
-                --config OGR_SQLITE_CACHE 1024 \
-                -dialect sqlite \
-                -sql "SELECT ST_Difference( \
-                        ST_UnaryUnion(ST_Collect(geometry)), \
-                        (SELECT ST_UnaryUnion(ST_Collect( \
-                            CASE WHEN ST_IsValid(geometry) THEN geometry ELSE ST_MakeValid(geometry) END \
-                        )) FROM 'gis_osm_water_a_free_1.shp'.gis_osm_water_a_free_1) \
-                      ) AS geometry \
-                      FROM local_land"
+              spython3 punch_holes.py
 
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
               tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
