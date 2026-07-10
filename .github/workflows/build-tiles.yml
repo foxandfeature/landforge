@@ -223,7 +223,7 @@ jobs:
                 -makevalid
 
               echo "2. Punching inland water out of the clipped land..."
-              spython3 punch_holes.py
+              python3 punch_holes.py
 
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
               tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
