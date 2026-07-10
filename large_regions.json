@@ -1,12 +1,8 @@
 [
-    "africa/cameroon",
-    "africa/ghana",
-    "africa/mozambique",
-    "africa/nigeria",
+    "africa/uganda",
     "antarctica",
-    "asia/bangladesh",
-    "asia/japan/kyushu",
-    "europe/denmark",
+    "asia/india/southern-zone",
+    "europe/austria",
     "europe/finland",
     "europe/norway/nord-norge",
     "europe/norway/ostlandet",
@@ -17,6 +13,7 @@
     "north-america/canada/alberta",
     "north-america/canada/british-columbia/north-admreg",
     "north-america/canada/manitoba",
+    "north-america/canada/newfoundland-and-labrador",
     "north-america/canada/quebec",
     "north-america/us/alaska",
     "north-america/us/florida"

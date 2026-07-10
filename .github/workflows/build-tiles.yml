@@ -164,7 +164,7 @@ jobs:
           fetch_with_retry() {
             local url="$1"
             local output="$2"
-            local max_attempts=5
+            local max_attempts=10
             local wait_seconds=15
             local attempt=1
 
@@ -203,13 +203,16 @@ jobs:
               ogr2ogr -f GeoJSON land_layer.geojson local_land.shp \
                 --config OGR_SQLITE_CACHE 1024 \
                 -dialect sqlite \
-                -sql "SELECT ST_Difference(ST_Union(geometry), \
-                      (SELECT ST_Union(ST_MakeValid(geometry)) \
-                       FROM 'gis_osm_water_a_free_1.shp'.gis_osm_water_a_free_1)) AS geometry \
+                -sql "SELECT ST_Difference( \
+                        ST_UnaryUnion(ST_Collect(geometry)), \
+                        (SELECT ST_UnaryUnion(ST_Collect( \
+                            CASE WHEN ST_IsValid(geometry) THEN geometry ELSE ST_MakeValid(geometry) END \
+                        )) FROM 'gis_osm_water_a_free_1.shp'.gis_osm_water_a_free_1) \
+                      ) AS geometry \
                       FROM local_land"
 
               FILENAME=$(echo "${REGION}" | tr '/' '-').mbtiles
-              tippecanoe -P -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
+              tippecanoe -U 60 -o "$FILENAME" -l land -z 14 -Z 0 --drop-densest-as-needed land_layer.geojson
               
               ELAPSED_TIME=$(( SECONDS - START_TIME ))
               echo "✅ Completed $REGION in $ELAPSED_TIME seconds."
@@ -247,7 +250,7 @@ jobs:
         run: |
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
-          gh release download v1.23.1 --repo protomaps/go-pmtiles --pattern "*linux*amd64*"
+          gh release download --repo protomaps/go-pmtiles --pattern "*Linux_x86_64*"
           tar -xf go-pmtiles_*
           sudo mv pmtiles /usr/local/bin/
 
