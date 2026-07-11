@@ -8,7 +8,7 @@ on:
       region:
         description: "Manual selection: Specific region or ALL_REGIONS"
         required: true
-        default: "europe/germany/niedersachsen"
+        default: "ALL_REGIONS"
         type: choice
         options:
           - "ALL_REGIONS"
@@ -19,7 +19,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   prepare:
@@ -280,46 +280,45 @@ jobs:
           github-token: ${{ github.token }}
 
       # --- PROCESSING & DEPLOYMENT ---
-      # Single global tiling pass: concatenating ndjson is cheap (no tile
-      # decode/re-encode like tile-join needed to do across hundreds of
-      # per-region mbtiles). tippecanoe writes .pmtiles directly (v2.17+),
-      # so tile-join isn't needed here at all anymore.
+      # EXPERIMENTAL: instead of one .pmtiles archive, extract raw
+      # {z}/{x}/{y}.pbf tiles directly and push the whole directory to
+      # gh-pages. --no-tile-compression writes uncompressed protobuf, so
+      # any static host's on-the-fly transport gzip "just works" without
+      # needing a custom Content-Encoding header (which GitHub Pages
+      # doesn't let us configure per file type anyway).
+      #
+      # Heads-up: at world scale z0-14 this can produce hundreds of
+      # thousands of tiny files. git/GitHub Pages were not designed for
+      # that many files in one repo - watch whether this step and the
+      # push below stay within reasonable time, and whether the repo/site
+      # size stays near GitHub Pages' recommended 1GB limit.
 
-      - name: Combine Regions and Build Global Tileset (Single Pass)
+      - name: Combine Regions and Extract Raw Tile Directory (Single Pass)
         run: |
-          mkdir -p deploy_folder
-
           echo "1. Decompressing & concatenating all regions into one global stream..."
           zcat download_ndjson/*.ndjson.gz > world_land.ndjson
 
-          echo "2. Building vector tiles once for the whole world..."
-          tippecanoe -P -U 60 --force \
-            -o deploy_folder/land.pmtiles \
+          echo "2. Building & extracting vector tiles as individual .pbf files..."
+          rm -rf deploy_folder
+          tippecanoe -P -U 60 --force --no-tile-compression \
+            -e deploy_folder \
             -l land -z 14 -Z 0 --drop-densest-as-needed \
             world_land.ndjson
 
-          echo "Final size:"
-          ls -lh deploy_folder/land.pmtiles
+          echo "Tile count:"
+          find deploy_folder -name "*.pbf" | wc -l
+          echo "Total size:"
+          du -sh deploy_folder
 
-      # NOTE: Deployment to gh-pages via git is disabled for now - the
-      # merged land.pmtiles is likely to exceed GitHub's ~100MB per-file
-      # limit for repo commits. Instead we publish it as a workflow
-      # artifact (no git size limit here, only storage-plan quotas), which
-      # can be downloaded and pushed elsewhere (e.g. an S3/R2 bucket) as a
-      # separate step once you've decided on final hosting.
-      - name: Upload PMTiles Artifact
-        uses: actions/upload-artifact@v4
+      - name: Prevent Jekyll Processing
+        run: touch deploy_folder/.nojekyll
+
+      - name: Deploy to GitHub Pages Branch
+        uses: JamesIves/github-pages-deploy-action@v4
         with:
-          name: land-pmtiles
-          path: deploy_folder/land.pmtiles
-          retention-days: 14
-
-      # - name: Deploy to GitHub Pages Branch
-      #   uses: JamesIves/github-pages-deploy-action@v4
-      #   with:
-      #     folder: deploy_folder
-      #     target-folder: tiles/land
-      #     branch: gh-pages
-      #     clean: true
-      #     commit-message: "Deploy Consolidated PMTiles Archive 🚀"
-      #     single-commit: true
+          folder: deploy_folder
+          target-folder: tiles/land
+          branch: gh-pages
+          clean: true
+          commit-message: "Deploy Raw PBF Tile Directory 🚀"
+          single-commit: true

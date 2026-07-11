@@ -421,5 +421,14 @@
     "north-america/us/washington",
     "north-america/us/west-virginia",
     "north-america/us/wisconsin",
-    "north-america/us/wyoming"
+    "north-america/us/wyoming",
+    "antarctica",
+    "europe/norway/ostlandet",
+    "north-america/canada/newfoundland-and-labrador",
+    "north-america/canada/northwest-territories",
+    "north-america/canada/nunavut/kitikmeot",
+    "north-america/canada/nunavut/kivalliq",
+    "north-america/canada/nunavut/qikiqtaaluk",
+    "north-america/canada/ontario",
+    "north-america/us/florida"
 ]
