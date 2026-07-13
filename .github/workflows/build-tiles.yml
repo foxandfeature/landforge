@@ -18,6 +18,13 @@ on:
 permissions:
   contents: write
 
+env:
+  # Dedicated orphan branches used purely as data/coordination stores -
+  # never merged into main. Defined once here since prepare, build-tiles,
+  # cleanup-region-queue, and update-timings all need the same names.
+  TIMINGS_BRANCH: region-timings
+  QUEUE_BRANCH: region-queue
+
 # Serializes runs so two concurrent workflows never race to commit
 # region_timings.json, fight over the tippecanoe/land-data caches, or
 # claim from the same region-queue branch (see prepare/build-tiles).
@@ -30,7 +37,7 @@ jobs:
     # No longer pre-packs regions into 20 fixed bins. It only computes
     # a priority order (largest estimated region first) and publishes
     # that order as a shared work queue on the region-queue branch.
-    # Actual assignment to runners happens live in build-tiles: whichever
+    # Actual assignment to workers happens live in build-tiles: whichever
     # of the (up to) 20 workers is free next claims whatever is currently
     # at the front of the queue. That adapts to real completion times
     # instead of only the pre-run estimate, which a fixed up-front
@@ -46,8 +53,6 @@ jobs:
         # region_timings.json lives on its own orphan branch (see
         # update-timings job) rather than main, so the auto-generated
         # timing commits never clutter the source-code commit history.
-        env:
-          TIMINGS_BRANCH: region-timings
         run: |
           if git ls-remote --exit-code --heads origin "$TIMINGS_BRANCH" >/dev/null 2>&1; then
             git fetch --depth 1 origin "$TIMINGS_BRANCH"
@@ -60,7 +65,7 @@ jobs:
       - name: Sort Regions by Estimated Time and Size the Worker Pool
         id: regions
         env:
-          NUM_RUNNERS: "20"
+          NUM_WORKERS: "20"
           # Only used before region_timings.json has any data at all
           # (i.e. the very first run ever). After that, unseen regions
           # fall back to the average of whatever we've measured so far.
@@ -71,7 +76,7 @@ jobs:
           python3 << 'PYEOF'
           import json, os, sys
 
-          NUM_RUNNERS = int(os.environ["NUM_RUNNERS"])
+          NUM_WORKERS = int(os.environ["NUM_WORKERS"])
           DEFAULT_ESTIMATE = float(os.environ["DEFAULT_ESTIMATE_SECONDS"])
           event_name = os.environ["EVENT_NAME"]
           manual_region = os.environ.get("MANUAL_REGION", "").strip()
@@ -111,14 +116,21 @@ jobs:
           known = [v for v in region_averages.values() if v is not None]
           fallback = (sum(known) / len(known)) if known else DEFAULT_ESTIMATE
 
-          # Largest-estimated-first. This order IS the work queue: every
-          # free worker claims whatever is currently at the front (see
-          # "Publish Region Queue" below and the claim loop in build-tiles).
-          estimates = [(r, region_averages.get(r) or fallback) for r in all_regions]
+          # Sorted largest-first: this list becomes the shared work queue
+          # that build-tiles' claim loop pulls from (see the job comment
+          # above, and claim_region() in build-tiles for how claiming works).
+          # Using an explicit None-check below rather than `or fallback` -
+          # a genuinely fast, 0-second-average region must not be
+          # silently replaced by the fallback estimate.
+          def estimate_for(region):
+              avg = region_averages.get(region)
+              return avg if avg is not None else fallback
+
+          estimates = [(r, estimate_for(r)) for r in all_regions]
           estimates.sort(key=lambda x: x[1], reverse=True)
           sorted_regions = [r for r, _ in estimates]
 
-          num_workers = min(NUM_RUNNERS, len(sorted_regions)) or 1
+          num_workers = min(NUM_WORKERS, len(sorted_regions)) or 1
 
           print(f"Queued {len(sorted_regions)} region(s) for {num_workers} worker(s):")
           for r, est in estimates:
@@ -136,8 +148,6 @@ jobs:
         # unconditionally: the top-level `concurrency` group guarantees
         # the previous run (and its queue) fully finished before this one
         # starts, so there's never a live claim to race against here.
-        env:
-          QUEUE_BRANCH: region-queue
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -181,6 +191,10 @@ jobs:
         run: echo "month=$(date +'%Y-%m')" >> "$GITHUB_OUTPUT"
 
       - name: Cache Global Land Data
+        # Keying on the month (rather than a content hash) forces a fresh
+        # download once a month in step with the cron schedule, since the
+        # upstream OSM land polygons are refreshed periodically but have
+        # no version identifier of their own to key a cache on.
         id: cache-land
         uses: actions/cache@v4
         with:
@@ -190,12 +204,47 @@ jobs:
       - name: Download Global Land Data (Only on Cache Miss)
         if: steps.cache-land.outputs.cache-hit != 'true'
         run: |
+          # Prints a % (or, if the server doesn't send a Content-Length,
+          # just the bytes so far) every 60s while a download is running,
+          # so a large multi-hundred-MB file doesn't look stalled in the
+          # log. Polls every 1s internally so it never delays a fast
+          # download waiting for a 60s tick that already passed.
+          download_with_progress() {
+            local url="$1"
+            local output="$2"
+            local log="$3"
+
+            local total_size
+            total_size=$(curl -sI --max-time 10 "$url" 2>/dev/null | tr -d '\r' | grep -i '^content-length:' | tail -n1 | awk '{print $2}')
+
+            wget -nv "$url" -O "$output" 2> "$log" &
+            local wget_pid=$!
+
+            local elapsed=0
+            while kill -0 "$wget_pid" 2>/dev/null; do
+              sleep 1
+              elapsed=$((elapsed + 1))
+              if [ $((elapsed % 60)) -eq 0 ] && kill -0 "$wget_pid" 2>/dev/null; then
+                local current_size
+                current_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+                if [ -n "$total_size" ] && [ "$total_size" -gt 0 ]; then
+                  local pct=$(( current_size * 100 / total_size ))
+                  echo "⏳ ${pct}% ($(numfmt --to=iec "$current_size")/$(numfmt --to=iec "$total_size")) - ${elapsed}s elapsed"
+                else
+                  echo "⏳ $(numfmt --to=iec "$current_size") downloaded so far - ${elapsed}s elapsed (server sent no Content-Length)"
+                fi
+              fi
+            done
+
+            wait "$wget_pid"
+          }
+
           echo "Cache miss! Downloading OSM land polygons from web..."
           attempt=1
           max_attempts=5
           wait_seconds=15
           while true; do
-            if wget -nv "https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip" -O land.zip 2> wget_error.log; then
+            if download_with_progress "https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip" land.zip wget_error.log; then
               break
             fi
 
@@ -271,14 +320,12 @@ jobs:
                   line = line.strip()
                   if not line or line == 'END':
                       if current:
-                          # Close the polygon loop if required
                           if current[0] != current[-1]: current.append(current[0])
                           polygons.append(f"(({','.join(current)}))")
                           current = []
                       continue
                   p = line.split()
                   if len(p) == 2: current.append(f"{p[0]} {p[1]}")
-          # Format structures cleanly into a single valid WKT geometry string
           wkt = f"MULTIPOLYGON({','.join(polygons)})" if len(polygons) > 1 else f"POLYGON{polygons[0]}"
           with open('boundary.wkt', 'w') as out: out.write(wkt)
           EOF
@@ -290,14 +337,16 @@ jobs:
 
       - name: Process Regions Until the Shared Queue Is Empty
         env:
+          # Mapshaper (Node-based) can exceed the default ~2GB heap on
+          # large regions when erasing water polygons; this raises the
+          # cap so process_region() doesn't crash partway through.
           NODE_OPTIONS: "--max-old-space-size=6144"
-          QUEUE_BRANCH: region-queue
         run: |
           echo "### Region Processing Metrics (Worker ${{ matrix.worker }})" >> $GITHUB_STEP_SUMMARY
           echo "| Region | Time (Seconds) | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|----------------|--------|" >> $GITHUB_STEP_SUMMARY
 
-          TIMINGS_FILE="timings-batch-${{ matrix.worker }}.json"
+          TIMINGS_FILE="timings-worker-${{ matrix.worker }}.json"
           echo '{}' > "$TIMINGS_FILE"
           FAILED_REGIONS=()
 
@@ -337,6 +386,39 @@ jobs:
             return 1
           }
 
+          # Reports % progress every 60s while a download runs - see the
+          # identical helper in setup-tools' land-data download step for
+          # why (polls every 1s so it never delays a fast download).
+          download_with_progress() {
+            local url="$1"
+            local output="$2"
+            local log="$3"
+
+            local total_size
+            total_size=$(curl -sI --max-time 10 "$url" 2>/dev/null | tr -d '\r' | grep -i '^content-length:' | tail -n1 | awk '{print $2}')
+
+            wget -nv "$url" -O "$output" 2> "$log" &
+            local wget_pid=$!
+
+            local elapsed=0
+            while kill -0 "$wget_pid" 2>/dev/null; do
+              sleep 1
+              elapsed=$((elapsed + 1))
+              if [ $((elapsed % 60)) -eq 0 ] && kill -0 "$wget_pid" 2>/dev/null; then
+                local current_size
+                current_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+                if [ -n "$total_size" ] && [ "$total_size" -gt 0 ]; then
+                  local pct=$(( current_size * 100 / total_size ))
+                  echo "⏳ $(basename "$url"): ${pct}% ($(numfmt --to=iec "$current_size")/$(numfmt --to=iec "$total_size")) - ${elapsed}s elapsed"
+                else
+                  echo "⏳ $(basename "$url"): $(numfmt --to=iec "$current_size") downloaded so far - ${elapsed}s elapsed (server sent no Content-Length)"
+                fi
+              fi
+            done
+
+            wait "$wget_pid"
+          }
+
           fetch_with_retry() {
             local url="$1"
             local output="$2"
@@ -345,7 +427,7 @@ jobs:
             local attempt=1
 
             while true; do
-              if wget -nv "$url" -O "$output" 2> wget_error.log; then
+              if download_with_progress "$url" "$output" wget_error.log; then
                 return 0
               fi
 
@@ -399,7 +481,16 @@ jobs:
               -makevalid
 
             echo "2. Punching inland water out of the clipped land (via Mapshaper)..."
-            mapshaper local_land.shp -erase gis_osm_water_a_free_1.shp -o land_layer.ndjson
+            # Explicit `format=geojson ndjson` is required here - without
+            # it, mapshaper writes a normal multi-line FeatureCollection
+            # object despite the .ndjson filename. combine-land-data later
+            # concatenates every region's output into one file, which only
+            # stays valid if each line is a standalone Feature (true
+            # ndjson/GeoJSON-Text-Sequence) - a concatenated string of
+            # FeatureCollection objects breaks tippecanoe's streaming
+            # parser (surfaces as "Found ] at top level" / "Reached EOF
+            # without all containers being closed").
+            mapshaper local_land.shp -erase gis_osm_water_a_free_1.shp -o land_layer.ndjson format=geojson ndjson
 
             # Instead of tiling this region on its own, keep the raw erased
             # geometry and compress it. Tiling happens once for the whole
@@ -447,26 +538,53 @@ jobs:
             exit 1
           fi
 
-      - name: Upload Batch Artifact
+      - name: Upload Worker Artifact
         # Runs even if the step above ultimately failed (some region(s)
         # failed permanently) so every region this worker DID finish
-        # still makes it into build-pmtiles.
+        # still makes it into build-pmtiles. "warn" (not the default
+        # "error") because a worker whose very first claim already
+        # failed permanently may legitimately produce zero files.
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: land-ndjson-batch-${{ matrix.worker }}
+          name: land-ndjson-worker-${{ matrix.worker }}
           path: "*.ndjson.gz"
           retention-days: 1
           if-no-files-found: warn
 
-      - name: Upload Batch Timings
+      - name: Upload Worker Timings
+        # Same "warn" reasoning as the artifact upload above.
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: region-timings-batch-${{ matrix.worker }}
-          path: "timings-batch-*.json"
+          name: region-timings-worker-${{ matrix.worker }}
+          path: "timings-worker-*.json"
           retention-days: 1
           if-no-files-found: warn
+
+  cleanup-region-queue:
+    # The region-queue branch only exists to coordinate live claims while
+    # build-tiles is running (see prepare/build-tiles above). Once every
+    # worker has either emptied it or given up, nothing reads it again -
+    # and its commit history (one commit per claimed region) is pure
+    # churn with no lasting value, so the whole branch is deleted rather
+    # than left sitting around between runs. `prepare` recreates it as a
+    # fresh orphan branch from scratch at the start of the next run
+    # anyway, so there's nothing here worth preserving in the meantime.
+    if: ${{ !cancelled() }}
+    needs: [build-tiles]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Delete Region Queue Branch
+        run: |
+          if git ls-remote --exit-code --heads origin "$QUEUE_BRANCH" >/dev/null 2>&1; then
+            git push origin --delete "$QUEUE_BRANCH"
+          else
+            echo "$QUEUE_BRANCH branch is already gone - nothing to clean up."
+          fi
 
   update-timings:
     # Runs whenever build-tiles actually executed and wasn't cancelled
@@ -480,17 +598,15 @@ jobs:
     if: ${{ !cancelled() }}
     needs: [build-tiles]
     runs-on: ubuntu-latest
-    env:
-      TIMINGS_BRANCH: region-timings
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Download Per-Batch Region Timings
+      - name: Download Per-Worker Region Timings
         uses: actions/download-artifact@v4
         continue-on-error: true # no artifacts if every worker failed before finishing a single region, or a debug run skipped build-tiles
         with:
-          pattern: region-timings-batch-*
+          pattern: region-timings-worker-*
           path: download_region_timings
           merge-multiple: true
 
@@ -531,14 +647,14 @@ jobs:
           with open("region_timings.json") as f:
               timings = json.load(f)
 
-          batch_files = sorted(glob.glob("download_region_timings/timings-batch-*.json"))
-          if not batch_files:
+          timing_files = sorted(glob.glob("download_region_timings/timings-worker-*.json"))
+          if not timing_files:
               print("No region timing artifacts found - nothing to merge this run.")
           else:
-              for path in batch_files:
+              for path in timing_files:
                   with open(path) as f:
-                      batch = json.load(f)
-                  for region, seconds in batch.items():
+                      worker_timings = json.load(f)
+                  for region, seconds in worker_timings.items():
                       history = timings.get(region, [])
                       # Older region_timings.json snapshots may still hold a
                       # single number per region - migrate those transparently.
@@ -603,7 +719,7 @@ jobs:
         if: ${{ github.event.inputs.debug_run_id == '' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: land-ndjson-batch-*
+          pattern: land-ndjson-worker-*
           path: download_ndjson
           merge-multiple: true
 
@@ -611,7 +727,7 @@ jobs:
         if: ${{ github.event.inputs.debug_run_id != '' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: land-ndjson-batch-*
+          pattern: land-ndjson-worker-*
           path: download_ndjson
           merge-multiple: true
           run-id: ${{ github.event.inputs.debug_run_id }}
@@ -659,13 +775,19 @@ jobs:
 
       - name: Build Global PMTiles Archive
         run: |
+          # -P reads/writes in parallel; -U 60 logs progress every 60s so
+          # a multi-hour global build doesn't look stalled in the log.
+          # -Z 0 -z 14 keeps the same zoom range the old per-quadrant
+          # build covered; --drop-densest-as-needed lets tippecanoe thin
+          # dense areas automatically rather than failing on tile size.
+          #
           # No --no-tile-compression here (unlike the old raw-.pbf-folder
           # build): PMTiles stores gzip-compressed tiles per spec, and
           # clients like pmtiles.js/MapLibre GL decompress them on the fly.
           # felt/tippecanoe writes PMTiles natively when -o ends in .pmtiles.
           tippecanoe -P -U 60 --force \
             -o world.pmtiles \
-            -l land -Z 0 -z 14 --drop-densest-as-needed \
+            -l land -Z 0 -z 12 --drop-densest-as-needed \
             world_land.ndjson
 
           echo "PMTiles archive size:"
