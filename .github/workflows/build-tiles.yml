@@ -726,6 +726,7 @@ jobs:
     # of this job re-fetching per-region artifacts and redoing the merge.
     if: ${{ !cancelled() && !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
     needs: [build-tiles]
+    runs-on: ubuntu-latest
     steps:
       - name: Download Land Geometry (Standard Workflow Execution)
         if: ${{ github.event.inputs.debug_run_id == '' }}
