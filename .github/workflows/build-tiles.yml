@@ -11,9 +11,17 @@ on:
         default: "ALL_REGIONS"
         type: string
       debug_run_id:
-        description: "DEBUG: Run ID to download existing artifacts (skips tile generation)"
+        description: "DEBUG: Run ID to download existing artifacts from (skips tile generation)"
         required: false
         type: string
+      debug_resume_at:
+        description: "DEBUG: Only used when debug_run_id is set. Where to resume the pipeline from, using that run's artifacts."
+        required: false
+        type: choice
+        options:
+          - regions-merge
+          - pmtile-generation
+        default: regions-merge
 
 permissions:
   contents: write
@@ -711,9 +719,13 @@ jobs:
     # as failed for visibility, but every OTHER region's data still made
     # it into an artifact (see the `if: always()` uploads in build-tiles),
     # and the pmtiles archive should still get built from all of those.
-    if: ${{ !cancelled() }}
+    #
+    # Skipped entirely when debug_resume_at is "pmtile-generation": that
+    # mode means world-land-ndjson was already combined in debug_run_id's
+    # run, so build-pmtiles just downloads it from there directly instead
+    # of this job re-fetching per-region artifacts and redoing the merge.
+    if: ${{ !cancelled() && !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
     needs: [build-tiles]
-    runs-on: ubuntu-latest
     steps:
       - name: Download Land Geometry (Standard Workflow Execution)
         if: ${{ github.event.inputs.debug_run_id == '' }}
@@ -752,6 +764,12 @@ jobs:
     # clients (e.g. MapLibre GL via the pmtiles.js plugin) can stream
     # directly, so this is also the artifact we publish as a GitHub
     # Release below - no gh-pages hosting involved anymore.
+    #
+    # `!cancelled()` (rather than the default success()) is what lets
+    # this job still run when combine-land-data was itself skipped -
+    # exactly what happens on a DEBUG run with
+    # debug_resume_at: pmtile-generation (see the download step below,
+    # which pulls world-land-ndjson straight from debug_run_id in that case).
     if: ${{ !cancelled() }}
     needs: [combine-land-data, setup-tools]
     runs-on: ubuntu-latest
@@ -768,10 +786,25 @@ jobs:
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
-      - name: Download Combined Land Data
+      - name: Download Combined Land Data (Standard Workflow Execution, or DEBUG Resuming at Regions-Merge)
+        # Covers a normal run and a DEBUG run with debug_resume_at set to
+        # "regions-merge" - in both cases combine-land-data ran earlier in
+        # THIS workflow run and just uploaded world-land-ndjson for us.
+        if: ${{ !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
         uses: actions/download-artifact@v4
         with:
           name: world-land-ndjson
+
+      - name: Download Combined Land Data (DEBUG Mode - Resuming at PMTiles Generation)
+        # combine-land-data was skipped this run (see its `if`), so pull
+        # the already-combined world-land-ndjson straight from
+        # debug_run_id's own run instead.
+        if: ${{ github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: world-land-ndjson
+          run-id: ${{ github.event.inputs.debug_run_id }}
+          github-token: ${{ github.token }}
 
       - name: Build Global PMTiles Archive
         run: |
