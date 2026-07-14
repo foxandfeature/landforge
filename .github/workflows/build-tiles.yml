@@ -488,7 +488,17 @@ jobs:
               -clipsrc "$(cat boundary.wkt)" \
               -makevalid
 
-            echo "2. Punching inland water out of the clipped land (via Mapshaper)..."
+            echo "2. Filtering glaciers and wetlands out of Geofabrik's water layer..."
+            # gis_osm_water_a_free_1 lumps real open water together with
+            # glaciers (code 8211, natural=glacier) and wetlands (code
+            # 8221, natural=wetland). Neither of those is actually open
+            # water, so erasing them from land would incorrectly punch a
+            # "sea" hole where there's really solid ice or marshy ground.
+            # Filtered out here, before the erase step below ever sees them.
+            ogr2ogr -f "ESRI Shapefile" water_filtered.shp gis_osm_water_a_free_1.shp \
+              -where "fclass NOT IN ('glacier', 'wetland')"
+
+            echo "3. Punching inland water out of the clipped land (via Mapshaper)..."
             # Explicit `format=geojson ndjson` is required here - without
             # it, mapshaper writes a normal multi-line FeatureCollection
             # object despite the .ndjson filename. combine-land-data later
@@ -498,7 +508,7 @@ jobs:
             # FeatureCollection objects breaks tippecanoe's streaming
             # parser (surfaces as "Found ] at top level" / "Reached EOF
             # without all containers being closed").
-            mapshaper local_land.shp -erase gis_osm_water_a_free_1.shp -o land_layer.ndjson format=geojson ndjson
+            mapshaper local_land.shp -erase water_filtered.shp -o land_layer.ndjson format=geojson ndjson
 
             # Instead of tiling this region on its own, keep the raw erased
             # geometry and compress it. Tiling happens once for the whole
@@ -507,7 +517,7 @@ jobs:
             # decisions across neighbouring regions.
             local FILENAME
             FILENAME=$(echo "${REGION}" | tr '/' '-').ndjson.gz
-            echo "3. Compressing erased land geometry for later global tiling..."
+            echo "4. Compressing erased land geometry for later global tiling..."
             gzip -c land_layer.ndjson > "$FILENAME"
 
             local ELAPSED_TIME=$(( SECONDS - START_TIME ))
@@ -536,7 +546,7 @@ jobs:
             fi
 
             # Clear temporary space to prevent running out of disk storage across loop iterations
-            rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* boundary.wkt land_layer.ndjson local_land.* wget_error.log
+            rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* water_filtered.* boundary.wkt land_layer.ndjson local_land.* wget_error.log
           done
 
           if [ ${#FAILED_REGIONS[@]} -gt 0 ]; then
@@ -821,7 +831,7 @@ jobs:
           # felt/tippecanoe writes PMTiles natively when -o ends in .pmtiles.
           tippecanoe -P -U 60 --force \
             -o world.pmtiles \
-            -l land -Z 0 -z 13 --drop-densest-as-needed \
+            -l land -Z 0 -z 14 --drop-densest-as-needed \
             world_land.ndjson
 
           echo "PMTiles archive size:"
