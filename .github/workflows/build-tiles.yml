@@ -488,14 +488,15 @@ jobs:
               -clipsrc "$(cat boundary.wkt)" \
               -makevalid
 
-            echo "2. Filtering glaciers and wetlands out of the Geofabrik water layer..."
-            # Geofabrik's water layer (gis_osm_water_a_free_1) lumps
+            echo "2. Filtering glaciers and wetlands out of Geofabrik's water layer..."
+            # gis_osm_water_a_free_1 lumps real open water together with
             # glaciers (code 8211, natural=glacier) and wetlands (code
-            # 8221, natural=wetland) in with actual water bodies. Neither
-            # is real open water, so erasing them from land would punch
-            # holes in the land tiles where there should be solid land.
+            # 8221, natural=wetland). Neither of those is actually open
+            # water, so erasing them from land would incorrectly punch a
+            # "sea" hole where there's really solid ice or marshy ground.
+            # Filtered out here, before the erase step below ever sees them.
             ogr2ogr -f "ESRI Shapefile" water_filtered.shp gis_osm_water_a_free_1.shp \
-              -where "code NOT IN (8211, 8221)"
+              -where "fclass NOT IN ('glacier', 'wetland')"
 
             echo "3. Punching inland water out of the clipped land (via Mapshaper)..."
             # Explicit `format=geojson ndjson` is required here - without
@@ -820,9 +821,26 @@ jobs:
         run: |
           # -P reads/writes in parallel; -U 60 logs progress every 60s so
           # a multi-hour global build doesn't look stalled in the log.
-          # -Z 0 -z 14 keeps the same zoom range the old per-quadrant
-          # build covered; --drop-densest-as-needed lets tippecanoe thin
-          # dense areas automatically rather than failing on tile size.
+          #
+          # -z 14 stays as-is - the previous run's oversized tiles weren't
+          # a high-zoom problem: dense archipelago/fjord regions were
+          # already blowing past the 500KB tile-size cap as early as
+          # zoom 3-6. So instead of cutting maxzoom, the fix targets the
+          # low zooms directly:
+          #   -pS (--simplify-only-low-zooms) leaves z14 geometry exactly
+          #     as full-detail as before - only zooms below 14 get
+          #     simplified at all.
+          #   --simplification=10 multiplies that lower-zoom simplification
+          #     tolerance well above the default, so the low-zoom tiles
+          #     that were ballooning past 500KB shed most of their excess
+          #     vertices before tippecanoe even has to consider dropping
+          #     or coalescing features to hit the size cap. Raise/lower
+          #     this number to trade low-zoom detail against build time.
+          #   --coalesce-densest-as-needed stays on as a fallback for any
+          #     tile still too dense after simplification, merging dense
+          #     features into simplified combined shapes instead of the
+          #     outright feature-dropping that caused the long retry
+          #     loops seen before.
           #
           # No --no-tile-compression here (unlike the old raw-.pbf-folder
           # build): PMTiles stores gzip-compressed tiles per spec, and
@@ -830,7 +848,7 @@ jobs:
           # felt/tippecanoe writes PMTiles natively when -o ends in .pmtiles.
           tippecanoe -P -U 60 --force \
             -o world.pmtiles \
-            -l land -Z 0 -z 14 --drop-densest-as-needed \
+            -l land -Z 0 -z 14 -pS --simplification=10 --coalesce-densest-as-needed \
             world_land.ndjson
 
           echo "PMTiles archive size:"
