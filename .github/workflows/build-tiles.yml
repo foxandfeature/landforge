@@ -848,7 +848,7 @@ jobs:
           # felt/tippecanoe writes PMTiles natively when -o ends in .pmtiles.
           tippecanoe -P -U 60 --force \
             -o world.pmtiles \
-            -l land -Z 0 -z 14 -pS --simplification=10 --coalesce-densest-as-needed \
+            -l land -Z 0 -z 14 -pS --simplification=20 --coalesce-densest-as-needed \
             world_land.ndjson
 
           echo "PMTiles archive size:"
