@@ -488,15 +488,14 @@ jobs:
               -clipsrc "$(cat boundary.wkt)" \
               -makevalid
 
-            echo "2. Filtering glaciers and wetlands out of Geofabrik's water layer..."
-            # gis_osm_water_a_free_1 lumps real open water together with
+            echo "2. Filtering glaciers and wetlands out of the Geofabrik water layer..."
+            # Geofabrik's water layer (gis_osm_water_a_free_1) lumps
             # glaciers (code 8211, natural=glacier) and wetlands (code
-            # 8221, natural=wetland). Neither of those is actually open
-            # water, so erasing them from land would incorrectly punch a
-            # "sea" hole where there's really solid ice or marshy ground.
-            # Filtered out here, before the erase step below ever sees them.
+            # 8221, natural=wetland) in with actual water bodies. Neither
+            # is real open water, so erasing them from land would punch
+            # holes in the land tiles where there should be solid land.
             ogr2ogr -f "ESRI Shapefile" water_filtered.shp gis_osm_water_a_free_1.shp \
-              -where "fclass NOT IN ('glacier', 'wetland')"
+              -where "code NOT IN (8211, 8221)"
 
             echo "3. Punching inland water out of the clipped land (via Mapshaper)..."
             # Explicit `format=geojson ndjson` is required here - without
