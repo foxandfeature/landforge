@@ -1,4 +1,4 @@
-name: Build and Deploy Land Tiles
+name: Forge and Deploy Land Tiles
 
 on:
   schedule:
@@ -91,7 +91,6 @@ jobs:
 
           with open("regions.json") as f:
               all_regions_pool = json.load(f)
-
           with open("region_timings.json") as f:
               timings = json.load(f)
 
@@ -125,28 +124,26 @@ jobs:
           fallback = (sum(known) / len(known)) if known else DEFAULT_ESTIMATE
 
           # Sorted largest-first: this list becomes the shared work queue
-          # that build-tiles' claim loop pulls from (see the job comment
-          # above, and claim_region() in build-tiles for how claiming works).
-          # Using an explicit None-check below rather than `or fallback` -
-          # a genuinely fast, 0-second-average region must not be
-          # silently replaced by the fallback estimate.
+          # that build-tiles' claim loop pulls from. Explicit None-check
+          # (not `or fallback`) so a genuinely fast 0-second-average region
+          # isn't silently replaced by the fallback estimate.
           def estimate_for(region):
               avg = region_averages.get(region)
               return avg if avg is not None else fallback
 
-          estimates = [(r, estimate_for(r)) for r in all_regions]
-          estimates.sort(key=lambda x: x[1], reverse=True)
+          estimates = sorted(
+              ((r, estimate_for(r)) for r in all_regions),
+              key=lambda x: x[1], reverse=True,
+          )
           sorted_regions = [r for r, _ in estimates]
-
           num_workers = min(NUM_WORKERS, len(sorted_regions)) or 1
 
-          print(f"Queued {len(sorted_regions)} region(s) for {num_workers} worker(s):")
+          print(f"Queued {len(sorted_regions)} region(s) for the anvil, {num_workers} smith(s):")
           for r, est in estimates:
               print(f"  {r}: ~{est:.0f}s estimated (rolling average)")
 
           with open("queue.json", "w") as f:
               json.dump(sorted_regions, f)
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"worker_ids={json.dumps(list(range(num_workers)))}\n")
           PYEOF
@@ -163,7 +160,7 @@ jobs:
           git checkout --orphan "$QUEUE_BRANCH"
           git rm -rf . > /dev/null 2>&1 || true
           git add queue.json
-          git commit -m "chore: seed region queue ($(jq 'length' queue.json) region(s))"
+          git commit -m "chore: stoke the forge - seed region queue ($(jq 'length' queue.json) region(s))"
           git push --force origin "$QUEUE_BRANCH"
 
   setup-tools:
@@ -212,45 +209,36 @@ jobs:
       - name: Download Global Land Data (Only on Cache Miss)
         if: steps.cache-land.outputs.cache-hit != 'true'
         run: |
-          # Prints a % (or, if the server doesn't send a Content-Length,
-          # just the bytes so far) every 60s while a download is running,
-          # so a large multi-hundred-MB file doesn't look stalled in the
-          # log. Polls every 1s internally so it never delays a fast
-          # download waiting for a 60s tick that already passed.
+          # Prints a % (or just bytes, if the server omits Content-Length)
+          # every 60s so a large multi-hundred-MB download doesn't look
+          # stalled. The total size is read from wget's own -S response
+          # headers rather than a separate HEAD probe: Geofabrik answers a
+          # curl -I HEAD on the big files WITHOUT a Content-Length, but the
+          # real GET response carries one - so we grab it from there and
+          # finally get a real %. Polls every 1s so a fast download never
+          # waits on a 60s tick that already passed.
           download_with_progress() {
-            local url="$1"
-            local output="$2"
-            local log="$3"
+            local url="$1" output="$2" log="$3"
+            wget -nv -S "$url" -O "$output" 2> "$log" &
+            local wget_pid=$! total_size="" elapsed=0
 
-            local total_size
-            total_size=$(curl -sI --max-time 10 "$url" 2>/dev/null | tr -d '\r' | grep -i '^content-length:' | tail -n1 | awk '{print $2}')
-
-            wget -nv "$url" -O "$output" 2> "$log" &
-            local wget_pid=$!
-
-            local elapsed=0
             while kill -0 "$wget_pid" 2>/dev/null; do
-              sleep 1
-              elapsed=$((elapsed + 1))
+              sleep 1; elapsed=$((elapsed + 1))
+              [ -z "$total_size" ] && total_size=$(grep -i 'content-length:' "$log" | tail -n1 | awk '{print $2}' | tr -d '\r')
               if [ $((elapsed % 60)) -eq 0 ] && kill -0 "$wget_pid" 2>/dev/null; then
-                local current_size
-                current_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-                if [ -n "$total_size" ] && [ "$total_size" -gt 0 ]; then
-                  local pct=$(( current_size * 100 / total_size ))
-                  echo "⏳ ${pct}% ($(numfmt --to=iec "$current_size")/$(numfmt --to=iec "$total_size")) - ${elapsed}s elapsed"
+                local now; now=$(stat -c%s "$output" 2>/dev/null || echo 0)
+                if [ -n "$total_size" ] && [ "$total_size" -gt 0 ] 2>/dev/null; then
+                  echo "🔥 $(basename "$url"): $(( now * 100 / total_size ))% ($(numfmt --to=iec "$now")/$(numfmt --to=iec "$total_size")) - ${elapsed}s in the fire"
                 else
-                  echo "⏳ $(numfmt --to=iec "$current_size") downloaded so far - ${elapsed}s elapsed (server sent no Content-Length)"
+                  echo "🔥 $(basename "$url"): $(numfmt --to=iec "$now") drawn so far - ${elapsed}s in the fire (no Content-Length)"
                 fi
               fi
             done
-
             wait "$wget_pid"
           }
 
-          echo "Cache miss! Downloading OSM land polygons from web..."
-          attempt=1
-          max_attempts=5
-          wait_seconds=15
+          echo "🔥 Forge is cold - fetching raw ore (OSM land polygons)..."
+          attempt=1; max_attempts=5; wait_seconds=15
           while true; do
             if download_with_progress "https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip" land.zip wget_error.log; then
               break
@@ -261,17 +249,14 @@ jobs:
             if [ -n "$http_code" ] && [ "$http_code" -ge 400 ] && [ "$http_code" -lt 500 ]; then
               # A 4xx means the server understood the request and rejected
               # it as invalid (e.g. 404) - that points at the URL itself
-              # being wrong, not a transient server hiccup, so retrying
-              # wouldn't help.
+              # being wrong, not a transient hiccup, so retrying wouldn't help.
               echo "❌ Download got HTTP $http_code - treating as permanent, not retrying. wget said:"
-              cat wget_error.log
-              exit 1
+              cat wget_error.log; exit 1
             fi
 
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "❌ Failed to download land data after $attempt attempts."
-              cat wget_error.log
-              exit 1
+              cat wget_error.log; exit 1
             fi
 
             if [ -n "$http_code" ]; then
@@ -280,8 +265,7 @@ jobs:
               echo "⚠️  Attempt $attempt/$max_attempts failed (network error, no HTTP response). Retrying in ${wait_seconds}s..."
             fi
             sleep "$wait_seconds"
-            attempt=$((attempt + 1))
-            wait_seconds=$((wait_seconds * 2))
+            attempt=$((attempt + 1)); wait_seconds=$((wait_seconds * 2))
           done
           unzip -q -o land.zip -d land_data
           rm land.zip
@@ -343,16 +327,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Process Regions Until the Shared Queue Is Empty
+      - name: Forge Regions Until the Shared Queue Is Empty
         env:
           # Mapshaper (Node-based) can exceed the default ~2GB heap on
           # large regions when erasing water polygons; this raises the
           # cap so process_region() doesn't crash partway through.
           NODE_OPTIONS: "--max-old-space-size=6144"
         run: |
-          echo "### Region Processing Metrics (Worker ${{ matrix.worker }})" >> $GITHUB_STEP_SUMMARY
-          echo "| Region | Time (Seconds) | Result |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|----------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔨 Forge Log (Worker ${{ matrix.worker }})" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | Seconds in the Fire | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------------------|--------|" >> $GITHUB_STEP_SUMMARY
 
           TIMINGS_FILE="timings-worker-${{ matrix.worker }}.json"
           echo '{}' > "$TIMINGS_FILE"
@@ -361,31 +345,25 @@ jobs:
           # Claims the region currently at the front of the shared queue
           # (i.e. the largest still-remaining estimate, since prepare
           # publishes the queue pre-sorted descending) and removes it.
-          # Optimistic-locking with retry, the same rebase/push-retry
-          # idea already used for region_timings.json further down this
-          # workflow: if another worker's push wins the race first, we
-          # just refetch and claim whatever is now at the front instead.
+          # Optimistic-locking with retry, the same rebase/push-retry idea
+          # used for region_timings.json further down: if another worker's
+          # push wins the race, we just refetch and claim the new front.
           claim_region() {
             for attempt in $(seq 1 10); do
               git fetch origin "$QUEUE_BRANCH" -q
               git checkout -q -B "$QUEUE_BRANCH" "origin/$QUEUE_BRANCH"
 
-              local queue_len
-              queue_len=$(jq 'length' queue.json)
-              if [ "$queue_len" -eq 0 ]; then
-                return 1
-              fi
+              local queue_len; queue_len=$(jq 'length' queue.json)
+              [ "$queue_len" -eq 0 ] && return 1
 
-              local region
-              region=$(jq -r '.[0]' queue.json)
+              local region; region=$(jq -r '.[0]' queue.json)
               jq '.[1:]' queue.json > queue.json.next && mv queue.json.next queue.json
 
               git add queue.json
               git commit -q -m "chore: claim $region"
 
               if git push origin "$QUEUE_BRANCH" -q 2>/dev/null; then
-                echo "$region"
-                return 0
+                echo "$region"; return 0
               fi
 
               echo "Lost the claim race on attempt $attempt - retrying..." >&2
@@ -395,69 +373,51 @@ jobs:
           }
 
           # Reports % progress every 60s while a download runs - see the
-          # identical helper in setup-tools' land-data download step for
-          # why (polls every 1s so it never delays a fast download).
+          # identical helper in setup-tools' land-data step for why the
+          # size is read from wget -S rather than a curl -I HEAD probe
+          # (Geofabrik's big .shp.zip files answer HEAD without a
+          # Content-Length; the real GET response carries one).
           download_with_progress() {
-            local url="$1"
-            local output="$2"
-            local log="$3"
+            local url="$1" output="$2" log="$3"
+            wget -nv -S "$url" -O "$output" 2> "$log" &
+            local wget_pid=$! total_size="" elapsed=0
 
-            local total_size
-            total_size=$(curl -sI --max-time 10 "$url" 2>/dev/null | tr -d '\r' | grep -i '^content-length:' | tail -n1 | awk '{print $2}')
-
-            wget -nv "$url" -O "$output" 2> "$log" &
-            local wget_pid=$!
-
-            local elapsed=0
             while kill -0 "$wget_pid" 2>/dev/null; do
-              sleep 1
-              elapsed=$((elapsed + 1))
+              sleep 1; elapsed=$((elapsed + 1))
+              [ -z "$total_size" ] && total_size=$(grep -i 'content-length:' "$log" | tail -n1 | awk '{print $2}' | tr -d '\r')
               if [ $((elapsed % 60)) -eq 0 ] && kill -0 "$wget_pid" 2>/dev/null; then
-                local current_size
-                current_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
-                if [ -n "$total_size" ] && [ "$total_size" -gt 0 ]; then
-                  local pct=$(( current_size * 100 / total_size ))
-                  echo "⏳ $(basename "$url"): ${pct}% ($(numfmt --to=iec "$current_size")/$(numfmt --to=iec "$total_size")) - ${elapsed}s elapsed"
+                local now; now=$(stat -c%s "$output" 2>/dev/null || echo 0)
+                if [ -n "$total_size" ] && [ "$total_size" -gt 0 ] 2>/dev/null; then
+                  echo "🔥 $(basename "$url"): $(( now * 100 / total_size ))% ($(numfmt --to=iec "$now")/$(numfmt --to=iec "$total_size")) - ${elapsed}s in the fire"
                 else
-                  echo "⏳ $(basename "$url"): $(numfmt --to=iec "$current_size") downloaded so far - ${elapsed}s elapsed (server sent no Content-Length)"
+                  echo "🔥 $(basename "$url"): $(numfmt --to=iec "$now") drawn so far - ${elapsed}s in the fire (no Content-Length)"
                 fi
               fi
             done
-
             wait "$wget_pid"
           }
 
           fetch_with_retry() {
-            local url="$1"
-            local output="$2"
-            local max_attempts=10
-            local wait_seconds=15
-            local attempt=1
+            local url="$1" output="$2"
+            local max_attempts=10 wait_seconds=15 attempt=1
 
             while true; do
-              if download_with_progress "$url" "$output" wget_error.log; then
-                return 0
-              fi
+              download_with_progress "$url" "$output" wget_error.log && return 0
 
               local http_code
               http_code=$(grep -oP 'ERROR \K[0-9]+(?=:)' wget_error.log | tail -n1)
 
               if [ -n "$http_code" ] && [ "$http_code" -ge 400 ] && [ "$http_code" -lt 500 ]; then
-                # A 4xx (most commonly 404) means the server understood the
-                # request and rejected it as invalid - that points at the
-                # region path itself being wrong or no longer existing at
-                # Geofabrik, not at a transient server-side problem, so
-                # retrying it wouldn't help and would just hide the real
-                # issue behind retry noise.
-                echo "❌ $url returned HTTP $http_code - treating as a permanent/misconfiguration error, not retrying. wget said:"
-                cat wget_error.log
-                return 1
+                # A 4xx (most commonly 404) means the region path itself is
+                # wrong or no longer at Geofabrik, not a transient problem -
+                # retrying would just hide the real issue behind retry noise.
+                echo "❌ $url returned HTTP $http_code - permanent/misconfiguration error, not retrying. wget said:"
+                cat wget_error.log; return 1
               fi
 
               if [ "$attempt" -ge "$max_attempts" ]; then
                 echo "❌ Giving up on $url after $attempt attempts."
-                cat wget_error.log
-                return 1
+                cat wget_error.log; return 1
               fi
 
               if [ -n "$http_code" ]; then
@@ -466,14 +426,12 @@ jobs:
                 echo "⚠️  Attempt $attempt/$max_attempts for $url failed (network error, no HTTP response). Retrying in ${wait_seconds}s..."
               fi
               sleep "$wait_seconds"
-              attempt=$((attempt + 1))
-              wait_seconds=$((wait_seconds * 2))
+              attempt=$((attempt + 1)); wait_seconds=$((wait_seconds * 2))
             done
           }
 
           process_region() {
-            local REGION="$1"
-            local START_TIME=$SECONDS
+            local REGION="$1" START_TIME=$SECONDS
 
             fetch_with_retry "https://download.geofabrik.de/${REGION}.poly" region.poly || return 1
             fetch_with_retry "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" region.shp.zip || return 1
@@ -481,51 +439,48 @@ jobs:
             unzip -q -o region.shp.zip "gis_osm_water_a_free_1.*"
             python3 poly2wkt.py
 
-            echo "1. Clipping global land polygons to the boundary..."
-            # ogr2ogr filters global land polygons on disk to keep RAM usage low
-            ogr2ogr -f "ESRI Shapefile" local_land.shp \
+            echo "🔥 Heating the forge - clipping world land to ${REGION}'s mould..."
+            # ogr2ogr filters global land polygons on disk to keep RAM low.
+            # ENCODING=UTF-8 keeps the shapefile's DBF in UTF-8 instead of
+            # the default Latin-1 - that's what silences ogr2ogr's "couldn't
+            # be converted from UTF-8 to ISO-8859-1" warning. We only need
+            # the geometry, but there's no reason to mangle the text either.
+            ogr2ogr -f "ESRI Shapefile" -lco ENCODING=UTF-8 local_land.shp \
               land_data/land-polygons-split-4326/land_polygons.shp \
-              -clipsrc "$(cat boundary.wkt)" \
-              -makevalid
+              -clipsrc "$(cat boundary.wkt)" -makevalid
 
-            echo "2. Filtering glaciers and wetlands out of Geofabrik's water layer..."
+            echo "⚒️  Skimming slag - removing glaciers & wetlands from the water layer..."
             # gis_osm_water_a_free_1 lumps real open water together with
-            # glaciers (code 8211, natural=glacier) and wetlands (code
-            # 8221, natural=wetland). Neither of those is actually open
-            # water, so erasing them from land would incorrectly punch a
-            # "sea" hole where there's really solid ice or marshy ground.
-            # Filtered out here, before the erase step below ever sees them.
-            ogr2ogr -f "ESRI Shapefile" water_filtered.shp gis_osm_water_a_free_1.shp \
-              -where "fclass NOT IN ('glacier', 'wetland')"
+            # glaciers (code 8211, natural=glacier) and wetlands (code 8221,
+            # natural=wetland). Neither is open water, so erasing them from
+            # land would punch a phantom "sea" hole into solid ice / marsh.
+            ogr2ogr -f "ESRI Shapefile" -lco ENCODING=UTF-8 water_filtered.shp \
+              gis_osm_water_a_free_1.shp -where "fclass NOT IN ('glacier', 'wetland')"
 
-            echo "3. Punching inland water out of the clipped land (via Mapshaper)..."
-            # Explicit `format=geojson ndjson` is required here - without
-            # it, mapshaper writes a normal multi-line FeatureCollection
-            # object despite the .ndjson filename. combine-land-data later
-            # concatenates every region's output into one file, which only
-            # stays valid if each line is a standalone Feature (true
-            # ndjson/GeoJSON-Text-Sequence) - a concatenated string of
-            # FeatureCollection objects breaks tippecanoe's streaming
-            # parser (surfaces as "Found ] at top level" / "Reached EOF
-            # without all containers being closed").
+            echo "🔨 Hammering - striking inland water out of the glowing land (Mapshaper)..."
+            # Explicit `format=geojson ndjson` is required: without it mapshaper
+            # writes a multi-line FeatureCollection despite the .ndjson name,
+            # and combine-land-data concatenates every region into one stream
+            # that only stays valid if each line is a standalone Feature (true
+            # ndjson). A concatenation of FeatureCollection objects breaks
+            # tippecanoe's streaming parser ("Found ] at top level" / "Reached
+            # EOF without all containers being closed").
             mapshaper local_land.shp -erase water_filtered.shp -o land_layer.ndjson format=geojson ndjson
 
-            # Instead of tiling this region on its own, keep the raw erased
-            # geometry and compress it. Tiling happens once for the whole
-            # world in build-pmtiles - this avoids both the final tile-join
-            # fan-in bottleneck AND inconsistent --drop-densest-as-needed
-            # decisions across neighbouring regions.
-            local FILENAME
-            FILENAME=$(echo "${REGION}" | tr '/' '-').ndjson.gz
-            echo "4. Compressing erased land geometry for later global tiling..."
+            # Keep the raw erased geometry and just compress it; the whole
+            # world is tiled once in build-pmtiles. Avoids the tile-join
+            # fan-in AND inconsistent --drop-densest-as-needed decisions
+            # across neighbouring regions.
+            local FILENAME; FILENAME=$(echo "${REGION}" | tr '/' '-').ndjson.gz
+            echo "❄️  Quenching - compressing the forged land geometry..."
             gzip -c land_layer.ndjson > "$FILENAME"
 
             local ELAPSED_TIME=$(( SECONDS - START_TIME ))
-            echo "✅ Completed $REGION in $ELAPSED_TIME seconds."
-            echo "| \`$REGION\` | $ELAPSED_TIME | ✅ |" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Forged $REGION in $ELAPSED_TIME seconds."
+            echo "| \`$REGION\` | $ELAPSED_TIME | ⚒️ forged |" >> $GITHUB_STEP_SUMMARY
 
             # Record this region's duration so next month's `prepare` job
-            # can roll it into that region's average estimate.
+            # can roll it into that region's rolling average estimate.
             jq --arg region "$REGION" --argjson t "$ELAPSED_TIME" \
               '. + {($region): $t}' "$TIMINGS_FILE" > "${TIMINGS_FILE}.tmp" \
               && mv "${TIMINGS_FILE}.tmp" "$TIMINGS_FILE"
@@ -535,33 +490,31 @@ jobs:
           while true; do
             REGION=$(claim_region) || break
 
-            echo "========================================"
-            echo "Processing Region: $REGION"
-            echo "========================================"
+            echo "🔥🔥🔥  To the anvil: $REGION"
 
             if ! process_region "$REGION"; then
-              echo "::error::Region $REGION failed permanently - skipping it and continuing with the rest of the queue."
-              echo "| \`$REGION\` | - | ❌ failed |" >> $GITHUB_STEP_SUMMARY
+              echo "::error::Region $REGION cracked in the forge - skipping it and continuing with the queue."
+              echo "| \`$REGION\` | - | ❌ cracked |" >> $GITHUB_STEP_SUMMARY
               FAILED_REGIONS+=("$REGION")
             fi
 
-            # Clear temporary space to prevent running out of disk storage across loop iterations
+            # Clear temporary space to avoid running out of disk across iterations
             rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* water_filtered.* boundary.wkt land_layer.ndjson local_land.* wget_error.log
           done
 
           if [ ${#FAILED_REGIONS[@]} -gt 0 ]; then
-            echo "❌ ${#FAILED_REGIONS[@]} region(s) failed permanently: ${FAILED_REGIONS[*]}"
-            echo "This worker still uploads everything it DID build (see the steps below) -"
-            echo "it only exits non-zero here so the failure is visible in the Actions UI."
+            echo "❌ ${#FAILED_REGIONS[@]} region(s) cracked in the forge: ${FAILED_REGIONS[*]}"
+            echo "This worker still uploads everything it DID forge (see steps below) -"
+            echo "it only exits non-zero so the failure is visible in the Actions UI."
             exit 1
           fi
 
       - name: Upload Worker Artifact
         # Runs even if the step above ultimately failed (some region(s)
-        # failed permanently) so every region this worker DID finish
-        # still makes it into build-pmtiles. "warn" (not the default
-        # "error") because a worker whose very first claim already
-        # failed permanently may legitimately produce zero files.
+        # cracked permanently) so every region this worker DID forge still
+        # makes it into build-pmtiles. "warn" (not the default "error")
+        # because a worker whose very first claim already failed
+        # permanently may legitimately produce zero files.
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -584,11 +537,10 @@ jobs:
     # The region-queue branch only exists to coordinate live claims while
     # build-tiles is running (see prepare/build-tiles above). Once every
     # worker has either emptied it or given up, nothing reads it again -
-    # and its commit history (one commit per claimed region) is pure
-    # churn with no lasting value, so the whole branch is deleted rather
-    # than left sitting around between runs. `prepare` recreates it as a
-    # fresh orphan branch from scratch at the start of the next run
-    # anyway, so there's nothing here worth preserving in the meantime.
+    # and its commit history (one commit per claimed region) is pure churn
+    # with no lasting value, so the whole branch is deleted rather than
+    # left sitting around between runs. `prepare` recreates it as a fresh
+    # orphan branch at the start of the next run anyway.
     if: ${{ !cancelled() }}
     needs: [build-tiles]
     runs-on: ubuntu-latest
@@ -607,12 +559,11 @@ jobs:
   update-timings:
     # Runs whenever build-tiles actually executed and wasn't cancelled
     # outright. Deliberately NOT gated on it fully succeeding: with
-    # fail-fast disabled (and now, per-region failure isolation inside
-    # each worker), some regions can fail while others finish fine, and
-    # the timings from the successful ones are still worth keeping for
-    # next month's balancing. A debug run skips build-tiles entirely, so
-    # there's simply nothing new for region_timings.json that time - the
-    # merge step below already handles that gracefully.
+    # fail-fast disabled (and per-region failure isolation inside each
+    # worker), some regions can crack while others finish fine, and the
+    # timings from the successful ones are still worth keeping for next
+    # month's balancing. A debug run skips build-tiles entirely, so
+    # there's simply nothing new that time - the merge step handles it.
     if: ${{ !cancelled() }}
     needs: [build-tiles]
     runs-on: ubuntu-latest
@@ -629,10 +580,10 @@ jobs:
           merge-multiple: true
 
       - name: Switch to Dedicated Timings Branch
-        # Keeps the timings file's auto-commits off main entirely. If
-        # the branch already exists we check it out as-is; otherwise we
-        # create it as an orphan (no shared history with main) so it only
-        # ever contains this one small file, never a copy of the repo.
+        # Keeps the timings file's auto-commits off main entirely. If the
+        # branch exists we check it out as-is; otherwise we create it as an
+        # orphan (no shared history with main) so it only ever contains
+        # this one small file, never a copy of the repo.
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -674,8 +625,8 @@ jobs:
                       worker_timings = json.load(f)
                   for region, seconds in worker_timings.items():
                       history = timings.get(region, [])
-                      # Older region_timings.json snapshots may still hold a
-                      # single number per region - migrate those transparently.
+                      # Older snapshots may still hold a single number per
+                      # region - migrate those transparently.
                       if not isinstance(history, list):
                           history = [history]
                       history.append(seconds)
@@ -692,8 +643,7 @@ jobs:
           git add region_timings.json
 
           if git diff --cached --quiet; then
-            echo "No timing changes to commit."
-            exit 0
+            echo "No timing changes to commit."; exit 0
           fi
 
           git commit -m "chore: update region processing timings"
@@ -704,13 +654,10 @@ jobs:
               if ! git rebase "origin/$TIMINGS_BRANCH"; then
                 git rebase --abort
                 echo "Rebase conflict on attempt $attempt, retrying in 5s..."
-                sleep 5
-                continue
+                sleep 5; continue
               fi
             fi
-            if git push origin "HEAD:$TIMINGS_BRANCH"; then
-              exit 0
-            fi
+            git push origin "HEAD:$TIMINGS_BRANCH" && exit 0
             echo "Push attempt $attempt failed, retrying in 5s..."
             sleep 5
           done
@@ -720,20 +667,19 @@ jobs:
   combine-land-data:
     # Does the decompress+concatenate work exactly once and hands the
     # result to build-pmtiles as a single artifact. Kept as its own job
-    # (rather than inlined into build-pmtiles) so a DEBUG run can pull
-    # already-processed region geometry from an older workflow run
-    # without re-running build-tiles.
+    # (rather than inlined) so a DEBUG run can pull already-processed
+    # region geometry from an older workflow run without re-running
+    # build-tiles.
     #
     # Deliberately NOT gated on build-tiles fully succeeding (only on not
-    # being cancelled): a permanently-failed region marks its worker job
+    # being cancelled): a permanently-cracked region marks its worker job
     # as failed for visibility, but every OTHER region's data still made
     # it into an artifact (see the `if: always()` uploads in build-tiles),
     # and the pmtiles archive should still get built from all of those.
     #
     # Skipped entirely when debug_resume_at is "pmtile-generation": that
     # mode means world-land-ndjson was already combined in debug_run_id's
-    # run, so build-pmtiles just downloads it from there directly instead
-    # of this job re-fetching per-region artifacts and redoing the merge.
+    # run, so build-pmtiles downloads it from there directly instead.
     if: ${{ !cancelled() && !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
     needs: [build-tiles]
     runs-on: ubuntu-latest
@@ -759,8 +705,7 @@ jobs:
       - name: Concatenate All Regions into One Global Stream
         run: |
           zcat download_ndjson/*.ndjson.gz > world_land.ndjson
-          echo "Combined size:"
-          du -h world_land.ndjson
+          echo "Combined size:"; du -h world_land.ndjson
 
       - name: Upload Combined Land Data
         uses: actions/upload-artifact@v4
@@ -772,15 +717,15 @@ jobs:
   build-pmtiles:
     # Builds a single global PMTiles archive directly from the combined
     # land geometry - a single-file tile archive that HTTP range-aware
-    # clients (e.g. MapLibre GL via the pmtiles.js plugin) can stream
-    # directly, so this is also the artifact we publish as a GitHub
-    # Release below - no gh-pages hosting involved anymore.
+    # clients (e.g. MapLibre GL via pmtiles.js) can stream directly, so
+    # this is also the artifact we publish as a GitHub Release below - no
+    # gh-pages hosting involved anymore.
     #
-    # `!cancelled()` (rather than the default success()) is what lets
-    # this job still run when combine-land-data was itself skipped -
-    # exactly what happens on a DEBUG run with
-    # debug_resume_at: pmtile-generation (see the download step below,
-    # which pulls world-land-ndjson straight from debug_run_id in that case).
+    # `!cancelled()` (rather than the default success()) is what lets this
+    # job still run when combine-land-data was itself skipped - exactly
+    # what happens on a DEBUG run with debug_resume_at: pmtile-generation
+    # (the download step below pulls world-land-ndjson straight from
+    # debug_run_id in that case).
     if: ${{ !cancelled() }}
     needs: [combine-land-data, setup-tools]
     runs-on: ubuntu-latest
@@ -797,7 +742,7 @@ jobs:
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
-      - name: Download Combined Land Data (Standard Workflow Execution, or DEBUG Resuming at Regions-Merge)
+      - name: Download Combined Land Data (Standard Execution, or DEBUG Resuming at Regions-Merge)
         # Covers a normal run and a DEBUG run with debug_resume_at set to
         # "regions-merge" - in both cases combine-land-data ran earlier in
         # THIS workflow run and just uploaded world-land-ndjson for us.
@@ -817,7 +762,7 @@ jobs:
           run-id: ${{ github.event.inputs.debug_run_id }}
           github-token: ${{ github.token }}
 
-      - name: Build Global PMTiles Archive
+      - name: Temper the Global PMTiles Archive
         run: |
           # -P reads/writes in parallel; -U 60 logs progress every 60s so
           # a multi-hour global build doesn't look stalled in the log.
@@ -828,31 +773,27 @@ jobs:
           # zoom 3-6. So instead of cutting maxzoom, the fix targets the
           # low zooms directly:
           #   -pS (--simplify-only-low-zooms) leaves z14 geometry exactly
-          #     as full-detail as before - only zooms below 14 get
-          #     simplified at all.
-          #   --simplification=10 multiplies that lower-zoom simplification
-          #     tolerance well above the default, so the low-zoom tiles
-          #     that were ballooning past 500KB shed most of their excess
-          #     vertices before tippecanoe even has to consider dropping
-          #     or coalescing features to hit the size cap. Raise/lower
-          #     this number to trade low-zoom detail against build time.
-          #   --coalesce-densest-as-needed stays on as a fallback for any
-          #     tile still too dense after simplification, merging dense
-          #     features into simplified combined shapes instead of the
-          #     outright feature-dropping that caused the long retry
-          #     loops seen before.
+          #     as full-detail as before - only zooms below 14 simplify.
+          #   --simplification=10 multiplies that lower-zoom tolerance well
+          #     above the default, so the low-zoom tiles that were
+          #     ballooning shed most of their excess vertices before
+          #     tippecanoe even has to consider dropping/coalescing
+          #     features to hit the size cap. Raise/lower to trade
+          #     low-zoom detail against build time.
+          #   --drop-smallest-as-needed stays on as a fallback for any tile
+          #     still too dense after simplification.
           #
-          # No --no-tile-compression here (unlike the old raw-.pbf-folder
-          # build): PMTiles stores gzip-compressed tiles per spec, and
-          # clients like pmtiles.js/MapLibre GL decompress them on the fly.
-          # felt/tippecanoe writes PMTiles natively when -o ends in .pmtiles.
+          # No --no-tile-compression here (unlike the old raw-.pbf build):
+          # PMTiles stores gzip-compressed tiles per spec, and clients like
+          # pmtiles.js/MapLibre GL decompress them on the fly. felt/
+          # tippecanoe writes PMTiles natively when -o ends in .pmtiles.
+          echo "🔨 Tempering the world on the anvil..."
           tippecanoe -P -U 60 --force \
             -o world.pmtiles \
-            -l land -Z 0 -z 14 -pS --simplification=10 --drop-smallest-as-needed\
+            -l land -Z 0 -z 14 -pS --simplification=10 --drop-smallest-as-needed \
             world_land.ndjson
 
-          echo "PMTiles archive size:"
-          du -h world.pmtiles
+          echo "PMTiles archive size:"; du -h world.pmtiles
 
       - name: Upload PMTiles Artifact
         uses: actions/upload-artifact@v4
@@ -863,10 +804,9 @@ jobs:
 
   publish-release:
     # Publishes the PMTiles archive as an asset on a single, rolling
-    # GitHub Release instead of deploying to gh-pages. GitHub Release
-    # assets are served from a CDN that honours HTTP Range requests,
-    # which pmtiles.js/MapLibre GL need to stream chunks out of the
-    # archive on demand instead of downloading the whole file up front.
+    # GitHub Release instead of deploying to gh-pages. Release assets are
+    # served from a CDN that honours HTTP Range requests, which pmtiles.js
+    # /MapLibre GL need to stream chunks out of the archive on demand.
     if: ${{ !cancelled() }}
     needs: [build-pmtiles]
     runs-on: ubuntu-latest
@@ -888,10 +828,9 @@ jobs:
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
               --title "Global Land Tiles (PMTiles)" \
-              --notes "Automatically generated global land PMTiles archive, rebuilt monthly. The asset below is overwritten in place on every run - use the /releases/latest/download/ URL to always fetch the newest build." \
+              --notes "Freshly forged global land PMTiles archive, re-forged monthly. The asset below is overwritten in place on every run - use the /releases/latest/download/ URL to always fetch the newest build." \
               --latest
           fi
 
       - name: Upload PMTiles Asset (Overwrite Existing)
-        run: |
-          gh release upload "$RELEASE_TAG" world.pmtiles --clobber
+        run: gh release upload "$RELEASE_TAG" world.pmtiles --clobber
