@@ -368,6 +368,21 @@ jobs:
           sudo apt-get update && sudo apt-get install -y gdal-bin nodejs npm
           sudo npm install -g mapshaper
 
+      - name: Restore Tippecanoe Binaries from Cache
+        # Needed here (not just in build-pmtiles) because each worker now
+        # also tiles its own z8-14 shard at the end of its region loop - see
+        # "Tiling this worker's regions for z8-14" below.
+        uses: actions/cache/restore@v4
+        with:
+          path: tippecanoe-bin
+          key: ${{ runner.os }}-${{ needs.setup-tools.outputs.tippecanoe-key }}
+          fail-on-cache-miss: true
+
+      - name: Install Tippecanoe
+        run: |
+          sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
+          sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
+
       - name: Get Current Month for Cache Key
         id: date
         run: echo "month=$(date +'%Y-%m')" >> "$GITHUB_OUTPUT"
@@ -608,10 +623,11 @@ jobs:
               echo "Mapshaper erase step failed for $REGION."; return 1;
             }
 
-            # Keep the raw eroded geometry gzip-compressed instead of tiling
-            # per region - tiling happens once, globally, in build-pmtiles,
-            # avoiding a tile-join fan-in and inconsistent --drop-*
-            # decisions at region borders.
+            # Keep the raw eroded geometry gzip-compressed rather than tiling
+            # it here directly - this worker's regions get tiled together in
+            # one batch after the claim loop below (see "Tiling this worker's
+            # regions for z8-14"), and the full world gets combined separately
+            # for the low-zoom pass in build-low-zoom-pmtiles.
             local FILENAME; FILENAME=$(echo "${REGION}" | tr '/' '-').ndjson.gz
             echo "5/5 Quench — compressing and packing the finished land..."
             gzip -c land_layer.ndjson > "$FILENAME" && gzip -t "$FILENAME" 2>/dev/null || {
@@ -646,6 +662,32 @@ jobs:
             rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* water_filtered.* boundary.wkt land_layer.ndjson local_land.* wget_error.log
           done
 
+          # Tile this worker's own regions for z8-14 right here, in parallel
+          # with every other worker, instead of leaving all 15 zoom levels to
+          # a single global tippecanoe run at the end of the pipeline (that
+          # single-runner build was hitting GitHub's hard 6h job limit before
+          # even finishing). This is safe to parallelize per-worker because
+          # at z8+ a tile essentially never spans more than one region's own
+          # coastline, so there's no cross-region density decision to get
+          # inconsistent - unlike low zoom, where many regions can collapse
+          # into the same handful of shared tiles (see build-low-zoom-pmtiles,
+          # which handles z0-7 globally for exactly that reason). -pS still
+          # exempts the deepest zoom (14) from --simplification=10, same as
+          # the original single-build design.
+          echo "Tiling this worker's regions for z8-14..."
+          shopt -s nullglob
+          region_files=(*.ndjson.gz)
+          if [ ${#region_files[@]} -eq 0 ]; then
+            echo "No regions succeeded on this worker - nothing to tile."
+          else
+            for f in "${region_files[@]}"; do zcat "$f"; done > worker_land.ndjson
+            tippecanoe -P -U 60 --force \
+              -o "worker-${{ matrix.worker }}-highzoom.pmtiles" \
+              -l land -Z 8 -z 14 -pS --simplification=10 --drop-smallest-as-needed \
+              worker_land.ndjson
+            rm -f worker_land.ndjson
+          fi
+
           if [ ${#FAILED_REGIONS[@]} -gt 0 ]; then
             echo "${#FAILED_REGIONS[@]} region(s) failed: ${FAILED_REGIONS[*]}"
             echo "Everything that DID finish is still uploaded below; this non-zero"
@@ -656,8 +698,10 @@ jobs:
       - name: Upload Worker Artifact
         # Runs even on a failed step above (some region(s) failed
         # permanently) so every region this worker DID finish still makes it
-        # into build-pmtiles. "warn" because a worker whose very first claim
-        # already failed permanently may legitimately produce zero files.
+        # into build-low-zoom-pmtiles (via combine-land-data) and this
+        # worker's own high-zoom shard above. "warn" because a worker whose
+        # very first claim already failed permanently may legitimately
+        # produce zero files.
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -673,6 +717,18 @@ jobs:
         with:
           name: region-timings-worker-${{ matrix.worker }}
           path: "timings-worker-*.json"
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Upload Worker High-Zoom PMTiles Shard
+        # "warn" for the same reason as the raw ndjson artifact above: a
+        # worker whose very first claim already failed permanently never
+        # produces a shard to tile.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: highzoom-worker-${{ matrix.worker }}
+          path: "worker-*-highzoom.pmtiles"
           retention-days: 1
           if-no-files-found: warn
 
@@ -804,13 +860,16 @@ jobs:
 
   combine-land-data:
     # Does the decompress+concatenate work exactly once, as its own job
-    # (rather than inlined into build-pmtiles) so a DEBUG run can pull
-    # already-processed geometry from an older run without re-running
-    # build-tiles. Not gated on build-tiles fully succeeding (only on not
-    # cancelled): every region that DID finish still made it into an
-    # artifact, and the pmtiles archive should still build from those.
+    # (rather than inlined into build-low-zoom-pmtiles) so a DEBUG run can
+    # pull already-processed geometry from an older run without re-running
+    # build-tiles. Only feeds the global low-zoom (z0-7) shard now - the
+    # z8-14 shards are built directly from each worker's own regions in
+    # build-tiles, without ever passing through this combined stream. Not
+    # gated on build-tiles fully succeeding (only on not cancelled): every
+    # region that DID finish still made it into an artifact, and the
+    # low-zoom shard should still build from those.
     # Skipped when debug_resume_at is "pmtile-generation", since
-    # world-land-ndjson was already combined in debug_run_id's run.
+    # world-low-pmtiles was already built in debug_run_id's run.
     if: ${{ !cancelled() && !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
     needs: [build-tiles]
     runs-on: ubuntu-latest
@@ -870,21 +929,29 @@ jobs:
           fi
 
       - name: Upload Combined Land Data
-        if: always() # A partial world_land.ndjson (bad region(s) skipped above) should still flow to build-pmtiles rather than losing the whole month's run.
+        if: always() # A partial world_land.ndjson (bad region(s) skipped above) should still flow to build-low-zoom-pmtiles rather than losing the whole month's run.
         uses: actions/upload-artifact@v4
         with:
           name: world-land-ndjson
           path: world_land.ndjson
           retention-days: 1
 
-  build-pmtiles:
-    # Builds a single global PMTiles archive directly from the combined land
-    # geometry - a single-file archive that HTTP range-aware clients (e.g.
-    # MapLibre GL via pmtiles.js) can stream directly, and the artifact
-    # published as a GitHub Release below. `!cancelled()` lets this job still
-    # run when combine-land-data was itself skipped, as on a DEBUG run with
-    # debug_resume_at: pmtile-generation.
-    if: ${{ !cancelled() }}
+  build-low-zoom-pmtiles:
+    # Builds the z0-7 tileset globally, in one pass, over the full combined
+    # land geometry. This range needs a single global view because at low
+    # zoom many regions collapse into the same handful of shared tiles (at
+    # z0 every region on Earth maps to the same tile, 0/0/0) - simplification
+    # and --drop-smallest-as-needed decisions have to be made with the whole
+    # picture in view, or two regions sharing a tile could end up
+    # inconsistently simplified. It's still fast as a single global pass
+    # because z0-7 has orders of magnitude fewer tiles than the full z0-14
+    # range (see build-tiles' per-worker high-zoom step for why z8-14 is
+    # instead parallelized per-worker).
+    #
+    # Skipped when debug_resume_at is "pmtile-generation", since
+    # world-low-pmtiles was already built in debug_run_id's run - build-pmtiles
+    # pulls it from there directly instead.
+    if: ${{ !cancelled() && !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
     needs: [combine-land-data, setup-tools]
     runs-on: ubuntu-latest
     steps:
@@ -900,48 +967,143 @@ jobs:
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
-      - name: Download Combined Land Data (Standard Workflow Execution, or DEBUG Resuming at Regions-Merge)
+      - name: Download Combined Land Data
+        # combine-land-data always ran earlier in THIS run whenever this job
+        # runs (see the "if" above) - no debug-mode branch needed here, only
+        # in build-pmtiles below (which this shard still has to reach through).
+        uses: actions/download-artifact@v4
+        with:
+          name: world-land-ndjson
+
+      - name: Build Low-Zoom (z0-7) PMTiles Shard
+        run: |
+          # -P reads/writes in parallel; -U 60 logs progress every 60s.
+          #
+          # No -pS here: unlike the per-worker z8-14 shards (where z14 is
+          # deliberately left unsimplified, see build-tiles), every zoom in
+          # this z0-7 range counts as "low zoom" for the original
+          # oversized-tile fix, so --simplification=10 applies uniformly
+          # across all of it, including the top zoom (7) - it hands off
+          # cleanly to the per-worker shards' z8 tiles just below it.
+          #
+          # --drop-smallest-as-needed guards the case that actually caused
+          # this whole split: dense archipelago/fjord regions blowing past
+          # the 500KB tile-size cap as early as zoom 3-6.
+          tippecanoe -P -U 60 --force \
+            -o world_low.pmtiles \
+            -l land -Z 0 -z 7 --simplification=10 --drop-smallest-as-needed \
+            world_land.ndjson
+
+          echo "Low-zoom PMTiles shard size:"
+          du -h world_low.pmtiles
+
+      - name: Upload Low-Zoom PMTiles Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: world-low-pmtiles
+          path: world_low.pmtiles
+          retention-days: 1
+
+  build-pmtiles:
+    # Assembles the final global archive by tile-join-ing the low-zoom (z0-7)
+    # shard from build-low-zoom-pmtiles with every worker's high-zoom (z8-14)
+    # shard from build-tiles - replacing what used to be one single
+    # tippecanoe run over all 15 zoom levels, which was hitting GitHub's hard
+    # 6h per-job limit on hosted runners before it even finished. Splitting
+    # by zoom range keeps the same correctness guarantees the old single-build
+    # design had (the low-zoom range - the only one where regions genuinely
+    # overlap in the same tiles - is still decided globally, in one pass, by
+    # build-low-zoom-pmtiles) while parallelizing the z8-14 range across
+    # every build-tiles worker, since tiles that deep essentially never span
+    # more than one region's own coastline.
+    #
+    # `!cancelled()` lets this job still run when its needs were themselves
+    # skipped, as on a DEBUG run with debug_resume_at: pmtile-generation.
+    if: ${{ !cancelled() }}
+    needs: [build-tiles, build-low-zoom-pmtiles, setup-tools]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore Tippecanoe Binaries from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tippecanoe-bin
+          key: ${{ runner.os }}-${{ needs.setup-tools.outputs.tippecanoe-key }}
+          fail-on-cache-miss: true
+
+      - name: Install Tippecanoe
+        run: |
+          sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
+          sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
+
+      - name: Download Low-Zoom Shard (Standard Workflow Execution, or DEBUG Resuming at Regions-Merge)
         # Covers a normal run and a DEBUG run resuming at "regions-merge" -
-        # in both cases combine-land-data ran earlier in THIS run.
+        # in both cases build-low-zoom-pmtiles ran earlier in THIS run.
         if: ${{ !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
         uses: actions/download-artifact@v4
         with:
-          name: world-land-ndjson
+          name: world-low-pmtiles
+          path: shards
 
-      - name: Download Combined Land Data (DEBUG Mode - Resuming at PMTiles Generation)
-        # combine-land-data was skipped this run, so pull the
-        # already-combined data straight from debug_run_id's own run.
+      - name: Download Low-Zoom Shard (DEBUG Mode - Resuming at PMTiles Generation)
+        # build-low-zoom-pmtiles was skipped this run, so pull the
+        # already-built shard straight from debug_run_id's own run.
         if: ${{ github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation' }}
         uses: actions/download-artifact@v4
         with:
-          name: world-land-ndjson
+          name: world-low-pmtiles
+          path: shards
           run-id: ${{ github.event.inputs.debug_run_id }}
           github-token: ${{ github.token }}
 
-      - name: Build Global PMTiles Archive
+      - name: Download High-Zoom Shards (Standard Workflow Execution, or Any DEBUG Resume)
+        # build-tiles is skipped whenever debug_run_id is set at all
+        # (regardless of debug_resume_at), so its worker shards only exist as
+        # same-run artifacts on a standard run - a debug run always needs
+        # them from debug_run_id instead.
+        if: ${{ github.event.inputs.debug_run_id == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: highzoom-worker-*
+          path: shards
+          merge-multiple: true
+
+      - name: Download High-Zoom Shards (DEBUG Mode - Targets Older Workflow Run)
+        if: ${{ github.event.inputs.debug_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: highzoom-worker-*
+          path: shards
+          merge-multiple: true
+          run-id: ${{ github.event.inputs.debug_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Join Shards into the Final Global PMTiles Archive
         run: |
-          # -P reads/writes in parallel; -U 60 logs progress every 60s so a
-          # multi-hour global build doesn't look stalled.
+          shopt -s nullglob
+          shard_files=(shards/*.pmtiles)
+
+          if [ ${#shard_files[@]} -eq 0 ]; then
+            echo "No PMTiles shards were downloaded - nothing to join."
+            exit 1
+          fi
+
+          # -pk (--no-tile-size-limit) matters only here, not in the shard
+          # builds above: each shard already enforces the 500KB cap itself
+          # via --drop-smallest-as-needed, shrinking oversized tiles down
+          # before they're written. But tile-join's own default behavior for
+          # a tile that's STILL oversized after being merged from multiple
+          # shards (e.g. two neighboring regions' high-zoom shards sharing a
+          # border tile) is to skip it outright - silently punching a hole in
+          # the map at that tile, which is worse than letting a rare merged
+          # tile stay a bit large. -pk keeps that from happening.
           #
-          # -z 14 stays as-is: the oversized-tile problem wasn't high-zoom -
-          # dense archipelago/fjord regions were already blowing past the
-          # 500KB tile-size cap as early as zoom 3-6. So the fix targets low
-          # zooms directly: -pS (--simplify-only-low-zooms) leaves z14
-          # untouched and only simplifies below it; --simplification=10
-          # raises that low-zoom tolerance well above default so those tiles
-          # shed excess vertices before tippecanoe has to drop/coalesce
-          # features to hit the size cap (raise/lower to trade low-zoom
-          # detail against build time); --coalesce-densest-as-needed is the
-          # fallback for anything still too dense, merging dense features
-          # into simplified shapes instead of outright dropping them.
-          #
-          # No --no-tile-compression: PMTiles stores gzip-compressed tiles
-          # per spec, and pmtiles.js/MapLibre GL decompress on the fly.
-          # felt/tippecanoe writes PMTiles natively when -o ends in .pmtiles.
-          tippecanoe -P -U 60 --force \
+          # No --no-tile-compression, matching the old single-build command:
+          # PMTiles stores gzip-compressed tiles per spec, and
+          # pmtiles.js/MapLibre GL decompress on the fly.
+          tile-join --force -pk \
             -o world.pmtiles \
-            -l land -Z 0 -z 14 -pS --simplification=10 --drop-smallest-as-needed\
-            world_land.ndjson
+            -l land \
+            "${shard_files[@]}"
 
           echo "PMTiles archive size:"
           du -h world.pmtiles
