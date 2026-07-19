@@ -86,9 +86,15 @@ these branches or the shared caches.
      as if the region had succeeded.
    - A failed region is logged and skipped; it does not fail the whole worker or block other
      regions.
-   - Worker artifacts (`land-ndjson-worker-N`, `region-timings-worker-N`) are uploaded with
-     `if: always()` so partial progress survives even if the worker's loop ultimately exits
-     non-zero.
+   - **After the claim loop empties**, each worker runs Tippecanoe once over everything it
+     personally produced to build its own `z8-14` PMTiles shard (`worker-N-highzoom.pmtiles`,
+     via `-pS --simplification=10 --drop-smallest-as-needed`). This is safe to parallelize
+     per-worker — at `z8+` a tile essentially never spans more than one region's own coastline,
+     so there's no cross-region density decision that could come out inconsistent between
+     workers. (See `build-pmtiles` below for why the low zoom range can't be split this way.)
+   - Worker artifacts (`land-ndjson-worker-N`, `region-timings-worker-N`,
+     `highzoom-worker-N`) are uploaded with `if: always()` so partial progress survives even if
+     the worker's loop ultimately exits non-zero.
 
 4. **`cleanup-region-queue`** — deletes the `region-queue` branch once `build-tiles` is done
    (`prepare` recreates it fresh next run).
@@ -101,15 +107,31 @@ these branches or the shared caches.
    (`gzip -t`) and concatenates them into one `world_land.ndjson` stream. A corrupted/truncated
    artifact is skipped with a warning rather than aborting the whole merge, but the job still
    exits non-zero so it's visible, while still uploading the partial result (`if: always()`) so
-   `build-pmtiles` gets whatever succeeded.
+   `build-low-zoom-pmtiles` gets whatever succeeded. This stream now only feeds the low-zoom
+   shard below — the `z8-14` shards never pass through it, they're built directly from each
+   worker's own regions in `build-tiles`.
 
-7. **`build-pmtiles`** — runs Tippecanoe once, globally, over the combined stream to produce
-   `world.pmtiles` (`-z 14`, low-zoom-only simplification via `-pS --simplification=10`, plus
-   `--drop-smallest-as-needed` as a size-cap fallback). Tiling happens exactly once here rather
-   than per-region specifically to avoid inconsistent `--drop-*` decisions and a `tile-join`
-   fan-in across region boundaries.
+7. **`build-low-zoom-pmtiles`** — runs Tippecanoe once, globally, over the combined stream, but
+   only for `z0-7` (`--simplification=10 --drop-smallest-as-needed`, uniformly across the whole
+   range — no `-pS` here since nothing in this shard is the "final" deepest zoom). This range
+   can't be split per-worker like `z8-14` can: at low zoom many regions collapse into the same
+   handful of shared tiles (every region on Earth maps to `0/0/0` at `z0`), so simplification and
+   size-cap decisions need the whole picture in view or two regions sharing a tile could end up
+   inconsistently simplified. It's still cheap as a single global pass because `z0-7` has orders
+   of magnitude fewer tiles than the full `z0-14` range.
 
-8. **`publish-release`** — uploads `world.pmtiles` as an asset on a single rolling GitHub
+8. **`build-pmtiles`** — `tile-join`s the low-zoom shard from `build-low-zoom-pmtiles` together
+   with every worker's `z8-14` shard from `build-tiles` into the final `world.pmtiles`. Uses
+   `-pk`/`--no-tile-size-limit` — tile-join's *own* default behavior for a tile that's still
+   oversized after being merged from multiple shards (e.g. two neighboring regions' shards
+   sharing a border tile) is to skip it outright, silently punching a hole in the map; `-pk` keeps
+   that from happening, since each shard already enforced the 500KB cap itself before merging.
+   This two-tier zoom split (global low-zoom pass + per-worker high-zoom shards, joined at the
+   end) replaced an earlier design that ran Tippecanoe once, globally, across all 15 zoom levels
+   in this job — that single-runner build was hitting GitHub Actions' hard 6-hour per-job limit
+   on hosted runners before it even finished.
+
+9. **`publish-release`** — uploads `world.pmtiles` as an asset on a single rolling GitHub
    Release (tag `land-tiles-latest`), overwritten in place (`--clobber`) every run. Consumers
    should always fetch via `/releases/latest/download/world.pmtiles`, relying on GitHub's
    Range-request-capable CDN for `pmtiles.js`/MapLibre GL streaming.
