@@ -369,9 +369,9 @@ jobs:
           sudo npm install -g mapshaper
 
       - name: Restore Tippecanoe Binaries from Cache
-        # Needed here (not just in build-pmtiles) because each worker now
-        # also tiles its own z8-14 shard at the end of its region loop - see
-        # "Tiling this worker's regions for z8-14" below.
+        # Needed here (not just in build-pmtiles) because process_region now
+        # also tiles each region's own z8-14 shard right after erasing its
+        # water layer - see step "5/6 Temper" below.
         uses: actions/cache/restore@v4
         with:
           path: tippecanoe-bin
@@ -574,7 +574,7 @@ jobs:
             local REGION="$1"
             local START_TIME=$SECONDS
 
-            echo "1/5 Heat — downloading $REGION's boundary and water layer..."
+            echo "1/6 Heat — downloading $REGION's boundary and water layer..."
             fetch_with_retry "https://download.geofabrik.de/${REGION}.poly" region.poly || return 1
             fetch_zip_with_verification "https://download.geofabrik.de/${REGION}-latest-free.shp.zip" region.shp.zip || return 1
 
@@ -592,7 +592,7 @@ jobs:
             }
             python3 poly2wkt.py || { echo "Failed to parse $REGION's boundary.poly."; return 1; }
 
-            echo "2/5 Skim — dropping glaciers and wetlands from the water layer..."
+            echo "2/6 Skim — dropping glaciers and wetlands from the water layer..."
             # gis_osm_water_a_free_1 lumps open water together with glaciers
             # (8211) and wetlands (8221); neither is open water, so leaving
             # them in would let the later erase step punch a false "sea"
@@ -603,7 +603,7 @@ jobs:
               echo "Water filter step failed for $REGION."; return 1;
             }
 
-            echo "3/5 Cast — clipping the global land polygons to $REGION's boundary..."
+            echo "3/6 Cast — clipping the global land polygons to $REGION's boundary..."
             # Filters the global land polygons on disk (keeps RAM usage
             # down); boundary.wkt is the mould it clips against.
             ogr2ogr -f "ESRI Shapefile" local_land.shp \
@@ -612,7 +612,7 @@ jobs:
               echo "Clip step failed for $REGION."; return 1;
             }
 
-            echo "4/5 Hammer — erasing the water out of the cast land (Mapshaper)..."
+            echo "4/6 Hammer — erasing the water out of the cast land (Mapshaper)..."
             # `format=geojson ndjson` is required: without it mapshaper
             # writes a multi-line FeatureCollection despite the .ndjson
             # name, and combine-land-data concatenates every region into one
@@ -623,16 +623,45 @@ jobs:
               echo "Mapshaper erase step failed for $REGION."; return 1;
             }
 
-            # Keep the raw eroded geometry gzip-compressed rather than tiling
-            # it here directly - this worker's regions get tiled together in
-            # one batch after the claim loop below (see "Tiling this worker's
-            # regions for z8-14"), and the full world gets combined separately
-            # for the low-zoom pass in build-low-zoom-pmtiles.
-            local FILENAME; FILENAME=$(echo "${REGION}" | tr '/' '-').ndjson.gz
-            echo "5/5 Quench — compressing and packing the finished land..."
+            local REGION_SLUG; REGION_SLUG=$(echo "${REGION}" | tr '/' '-')
+
+            echo "5/6 Temper — tiling this region's high-zoom (z8-14) shard..."
+            # Tiles straight from the freshly-produced land_layer.ndjson,
+            # per region, right here - not gzipped-then-later-decompressed
+            # and batched across a whole worker's regions. That used to mean
+            # the tiling time was invisible to region_timings.json (which
+            # only wraps this function via $SECONDS), so a region that's
+            # cheap to clip but slow to tile (e.g. a dense archipelago)
+            # never got flagged as slow for next month's largest-estimate-
+            # first queue ordering. Doing it here folds tiling cost into the
+            # same timed span as everything else, so the dynamic queue
+            # naturally learns to schedule slow-to-tile regions earlier.
+            #
+            # Safe to do per-region (rather than needing a global view like
+            # build-low-zoom-pmtiles' z0-7 pass): at z8+ a tile essentially
+            # never spans more than one region's own coastline, so there's
+            # no cross-region density decision that could come out
+            # inconsistent between regions. -pS exempts the deepest zoom
+            # (14) from --simplification=10, same as the original
+            # single-build design this replaced.
+            tippecanoe -P -U 60 --force \
+              -o "${REGION_SLUG}-highzoom.pmtiles" \
+              -l land -Z 8 -z 14 -pS --simplification=10 --drop-smallest-as-needed \
+              land_layer.ndjson || {
+              echo "Tiling step failed for $REGION."; return 1;
+            }
+
+            # Also keep the raw eroded geometry gzip-compressed for
+            # combine-land-data - the full world still needs to be combined
+            # separately for the global low-zoom (z0-7) pass in
+            # build-low-zoom-pmtiles, which needs the raw, unclipped-detail
+            # geometry rather than anything derived from this region's own
+            # tiles.
+            local FILENAME; FILENAME="${REGION_SLUG}.ndjson.gz"
+            echo "6/6 Quench — compressing and packing the raw geometry for the low-zoom pass..."
             gzip -c land_layer.ndjson > "$FILENAME" && gzip -t "$FILENAME" 2>/dev/null || {
               echo "Packing $REGION produced a corrupt/empty archive - discarding it."
-              rm -f "$FILENAME"
+              rm -f "$FILENAME" "${REGION_SLUG}-highzoom.pmtiles"
               return 1
             }
 
@@ -661,32 +690,6 @@ jobs:
             # Clear the workbench so the loop doesn't fill up the disk.
             rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* water_filtered.* boundary.wkt land_layer.ndjson local_land.* wget_error.log
           done
-
-          # Tile this worker's own regions for z8-14 right here, in parallel
-          # with every other worker, instead of leaving all 15 zoom levels to
-          # a single global tippecanoe run at the end of the pipeline (that
-          # single-runner build was hitting GitHub's hard 6h job limit before
-          # even finishing). This is safe to parallelize per-worker because
-          # at z8+ a tile essentially never spans more than one region's own
-          # coastline, so there's no cross-region density decision to get
-          # inconsistent - unlike low zoom, where many regions can collapse
-          # into the same handful of shared tiles (see build-low-zoom-pmtiles,
-          # which handles z0-7 globally for exactly that reason). -pS still
-          # exempts the deepest zoom (14) from --simplification=10, same as
-          # the original single-build design.
-          echo "Tiling this worker's regions for z8-14..."
-          shopt -s nullglob
-          region_files=(*.ndjson.gz)
-          if [ ${#region_files[@]} -eq 0 ]; then
-            echo "No regions succeeded on this worker - nothing to tile."
-          else
-            for f in "${region_files[@]}"; do zcat "$f"; done > worker_land.ndjson
-            tippecanoe -P -U 60 --force \
-              -o "worker-${{ matrix.worker }}-highzoom.pmtiles" \
-              -l land -Z 8 -z 14 -pS --simplification=10 --drop-smallest-as-needed \
-              worker_land.ndjson
-            rm -f worker_land.ndjson
-          fi
 
           if [ ${#FAILED_REGIONS[@]} -gt 0 ]; then
             echo "${#FAILED_REGIONS[@]} region(s) failed: ${FAILED_REGIONS[*]}"
@@ -720,15 +723,17 @@ jobs:
           retention-days: 1
           if-no-files-found: warn
 
-      - name: Upload Worker High-Zoom PMTiles Shard
-        # "warn" for the same reason as the raw ndjson artifact above: a
-        # worker whose very first claim already failed permanently never
-        # produces a shard to tile.
+      - name: Upload Worker High-Zoom PMTiles Shards
+        # One .pmtiles file per region this worker successfully processed
+        # (tiled inside process_region itself, see "5/6 Temper" above),
+        # bundled into one artifact per worker same as the raw ndjson.
+        # "warn" for the same reason as that artifact: a worker whose very
+        # first claim already failed permanently never produces one.
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: highzoom-worker-${{ matrix.worker }}
-          path: "worker-*-highzoom.pmtiles"
+          path: "*-highzoom.pmtiles"
           retention-days: 1
           if-no-files-found: warn
 

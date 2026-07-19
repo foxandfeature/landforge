@@ -78,7 +78,21 @@ these branches or the shared caches.
    - `mapshaper -erase` the filtered water out of the clipped land, writing **newline-delimited**
      GeoJSON (`format=geojson ndjson` is required — a plain FeatureCollection would break the
      later global concatenation and Tippecanoe's streaming parser).
-   - gzip the result, verify the archive isn't corrupt, and record elapsed time.
+   - Tile that region's own `z8-14` PMTiles shard directly from the freshly-produced NDJSON
+     (`-pS --simplification=10 --drop-smallest-as-needed`), right here, per region — not batched
+     across a worker's regions or routed through a gzip round-trip first. Doing it in the same
+     `$SECONDS`-timed span as everything else in `process_region` means a region that's slow to
+     *tile* (not just slow to download/clip) still shows up in `region_timings.json`, so the
+     dynamic largest-estimate-first queue naturally learns to schedule it earlier next run — the
+     timing/scheduling machinery doesn't need to know or care that tiling happens here too. Safe
+     to do per-region rather than needing a global view: at `z8+` a tile essentially never spans
+     more than one region's own coastline, so there's no cross-region density decision that could
+     come out inconsistent between regions. (See `build-pmtiles` below for why the low zoom range
+     can't be split this way.)
+   - gzip the raw NDJSON too (separately from the tiles), verify the archive isn't corrupt, and
+     record elapsed time. This copy still feeds `combine-land-data` for the global low-zoom pass,
+     which needs the raw, unclipped-detail geometry rather than anything derived from a region's
+     own tiles.
    - Every step is explicitly checked with `|| return 1` rather than relying on `set -e`,
      because this function is invoked as `if ! process_region ...` — bash suppresses `errexit`
      for the entire duration of any command tested by `if`/`!`, including inside called
@@ -86,15 +100,10 @@ these branches or the shared caches.
      as if the region had succeeded.
    - A failed region is logged and skipped; it does not fail the whole worker or block other
      regions.
-   - **After the claim loop empties**, each worker runs Tippecanoe once over everything it
-     personally produced to build its own `z8-14` PMTiles shard (`worker-N-highzoom.pmtiles`,
-     via `-pS --simplification=10 --drop-smallest-as-needed`). This is safe to parallelize
-     per-worker — at `z8+` a tile essentially never spans more than one region's own coastline,
-     so there's no cross-region density decision that could come out inconsistent between
-     workers. (See `build-pmtiles` below for why the low zoom range can't be split this way.)
-   - Worker artifacts (`land-ndjson-worker-N`, `region-timings-worker-N`,
-     `highzoom-worker-N`) are uploaded with `if: always()` so partial progress survives even if
-     the worker's loop ultimately exits non-zero.
+   - Worker artifacts (`land-ndjson-worker-N`, `region-timings-worker-N`, `highzoom-worker-N` —
+     the last bundling every region's own `.pmtiles` shard this worker produced) are uploaded
+     with `if: always()` so partial progress survives even if the worker's loop ultimately exits
+     non-zero.
 
 4. **`cleanup-region-queue`** — deletes the `region-queue` branch once `build-tiles` is done
    (`prepare` recreates it fresh next run).
@@ -108,8 +117,8 @@ these branches or the shared caches.
    artifact is skipped with a warning rather than aborting the whole merge, but the job still
    exits non-zero so it's visible, while still uploading the partial result (`if: always()`) so
    `build-low-zoom-pmtiles` gets whatever succeeded. This stream now only feeds the low-zoom
-   shard below — the `z8-14` shards never pass through it, they're built directly from each
-   worker's own regions in `build-tiles`.
+   shard below — the `z8-14` shards never pass through it, they're tiled directly from each
+   region's own NDJSON inside `process_region`, in `build-tiles`.
 
 7. **`build-low-zoom-pmtiles`** — runs Tippecanoe once, globally, over the combined stream, but
    only for `z0-7` (`--simplification=10 --drop-smallest-as-needed`, uniformly across the whole
@@ -121,12 +130,13 @@ these branches or the shared caches.
    of magnitude fewer tiles than the full `z0-14` range.
 
 8. **`build-pmtiles`** — `tile-join`s the low-zoom shard from `build-low-zoom-pmtiles` together
-   with every worker's `z8-14` shard from `build-tiles` into the final `world.pmtiles`. Uses
-   `-pk`/`--no-tile-size-limit` — tile-join's *own* default behavior for a tile that's still
+   with every region's own `z8-14` shard from `build-tiles` (one `.pmtiles` per successfully
+   processed region, bundled per worker into `highzoom-worker-N`) into the final `world.pmtiles`.
+   Uses `-pk`/`--no-tile-size-limit` — tile-join's *own* default behavior for a tile that's still
    oversized after being merged from multiple shards (e.g. two neighboring regions' shards
    sharing a border tile) is to skip it outright, silently punching a hole in the map; `-pk` keeps
    that from happening, since each shard already enforced the 500KB cap itself before merging.
-   This two-tier zoom split (global low-zoom pass + per-worker high-zoom shards, joined at the
+   This two-tier zoom split (global low-zoom pass + per-region high-zoom shards, joined at the
    end) replaced an earlier design that ran Tippecanoe once, globally, across all 15 zoom levels
    in this job — that single-runner build was hitting GitHub Actions' hard 6-hour per-job limit
    on hosted runners before it even finished.
