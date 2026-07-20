@@ -382,26 +382,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Export Artifact Runtime Env Vars for Per-Region node Scripts
-        # ACTIONS_RUNTIME_TOKEN/ACTIONS_RESULTS_URL/ACTIONS_RUNTIME_URL are
-        # what @actions/artifact needs to authenticate, but GitHub only
-        # injects them into the process of an action invoked via `uses:`
-        # (which is how actions/upload-artifact itself gets away with
-        # reading them) - NOT into a plain `run:` shell step's environment,
-        # confirmed by this job's own per-region "node -e" upload failing
-        # with "Unable to get the ACTIONS_RUNTIME_TOKEN env variable" the
-        # first time this ran. github-script's own action process CAN see
-        # them, so this reads them once and re-exports them via
-        # core.exportVariable into $GITHUB_ENV, making them ordinary env
-        # vars for every later `run:` step in this job - including the
-        # per-region node -e calls inside the claim loop below.
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env['ACTIONS_RESULTS_URL'])
-            core.exportVariable('ACTIONS_RUNTIME_URL', process.env['ACTIONS_RUNTIME_URL'])
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env['ACTIONS_RUNTIME_TOKEN'])
-
       - name: Install GDAL & Mapshaper
         run: |
           sudo apt-get update && sudo apt-get install -y gdal-bin nodejs npm
@@ -417,18 +397,6 @@ jobs:
           path: land_data
           key: ${{ runner.os }}-land-data-${{ steps.date.outputs.month }}
           fail-on-cache-miss: true
-
-      - name: Install Per-Region Artifact Uploader
-        # GitHub's actions/upload-artifact step can't be parameterized by a
-        # name computed at runtime inside a bash loop (steps are static at
-        # workflow-parse time), but this job needs to publish one artifact
-        # per region (not one bundle per worker) so build-tiles-highzoom can
-        # claim-and-fetch exactly the region it needs instead of every
-        # worker bulk-downloading every region's data. @actions/artifact is
-        # the same SDK actions/upload-artifact itself wraps, called directly
-        # instead - it only needs the ACTIONS_RUNTIME_TOKEN/URL every job
-        # step already has, no extra secrets.
-        run: npm install --no-save @actions/artifact@^2
 
       - name: Create Python Helper Script
         run: |
@@ -610,41 +578,13 @@ jobs:
             done
           }
 
-          # The @actions/artifact SDK call itself can fail transiently (e.g.
-          # ETIMEDOUT reaching the Actions results service) exactly like any
-          # other network call - retry with the same backoff shape as the
-          # HTTP fetch helpers above, instead of discarding an otherwise
-          # fully-processed region over one flaky request.
-          publish_ndjson_artifact() {
-            local region_slug="$1" filename="$2"
-            local max_attempts=5 wait_seconds=15 attempt=1
-            while true; do
-              if node -e "
-                const { DefaultArtifactClient } = require('@actions/artifact');
-                (async () => {
-                  const client = new DefaultArtifactClient();
-                  await client.uploadArtifact('ndjson-${region_slug}', ['${filename}'], '.', { retentionDays: 1 });
-                })().catch((err) => { console.error(err); process.exit(1); });
-              "; then
-                return 0
-              fi
-              if [ "$attempt" -ge "$max_attempts" ]; then
-                echo "Giving up publishing ndjson-${region_slug} after $attempt attempts."
-                return 1
-              fi
-              echo "Artifact upload attempt $attempt/$max_attempts for ndjson-${region_slug} failed (transient error, e.g. ETIMEDOUT). Retrying in ${wait_seconds}s..."
-              sleep "$wait_seconds"
-              attempt=$((attempt + 1))
-              wait_seconds=$((wait_seconds * 2))
-            done
-          }
-
           # Forging order: heat the raw ore (download), skim the slag off
           # (drop glaciers/wetlands from the water layer), cast and hammer
           # the land into shape (clip to boundary, then erase the water out
-          # of it), quench (compress, pack, and publish). Skimming happens
-          # before casting so the water layer is already clean by the time
-          # it's used to hammer the cast land into its final shape. Tiling
+          # of it), quench (compress and pack, ready for this worker's final
+          # bundled upload). Skimming happens before casting so the water
+          # layer is already clean by the time it's used to hammer the cast
+          # land into its final shape. Tiling
           # used to happen here too, per region - it's now
           # build-tiles-highzoom's job instead, sharded by tile-grid cell
           # rather than by region (see prepare-tile-queue for why), so
@@ -729,24 +669,16 @@ jobs:
 
             # Gzip-compressed for two consumers: combine-land-data (which
             # concatenates every region's copy into one global stream for
-            # the low-zoom z0-7 pass) and build-tiles-highzoom (which
-            # decompresses this exact file, along with every other region
-            # sharing its claimed tile-grid cell, to tile that cell's z8-14
-            # shard). Published as its own per-region artifact rather than
-            # bundled with other regions into one per-worker artifact, so
-            # build-tiles-highzoom's workers can each claim-and-fetch
-            # exactly the regions a claimed tile needs instead of every
-            # worker bulk-downloading every region's data.
+            # the low-zoom z0-7 pass) and build-tiles-highzoom (indirectly,
+            # via that same combined stream, to tile z8-14). Kept in the
+            # worker's own workspace rather than published individually -
+            # every region this worker finishes is bundled into one
+            # ndjson-worker-N artifact at the end of the job instead, the
+            # same pattern already used for this worker's timings/bboxes.
             local FILENAME; FILENAME="${REGION_SLUG}.ndjson.gz"
-            echo "5/5 Quench — compressing, packing, and publishing the raw geometry..."
+            echo "5/5 Quench — compressing and packing the raw geometry..."
             gzip -c land_layer.ndjson > "$FILENAME" && gzip -t "$FILENAME" 2>/dev/null || {
               echo "Packing $REGION produced a corrupt/empty archive - discarding it."
-              rm -f "$FILENAME"
-              return 1
-            }
-
-            publish_ndjson_artifact "$REGION_SLUG" "$FILENAME" || {
-              echo "Publishing $REGION's ndjson artifact failed."
               rm -f "$FILENAME"
               return 1
             }
@@ -784,12 +716,27 @@ jobs:
             exit 1
           fi
 
+      - name: Upload Worker NDJSON Bundle
+        # Every region this worker finished is still sitting in the
+        # workspace as its own <slug>.ndjson.gz (build_region_ndjson no
+        # longer publishes them individually) - bundle them all into one
+        # artifact per worker, same pattern as the timings/bboxes uploads
+        # below. combine-land-data and (indirectly, via that combined
+        # stream) build-tiles-highzoom both consume these bundles. "warn"
+        # because a worker whose very first claim already failed
+        # permanently may legitimately produce zero files.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ndjson-worker-${{ matrix.worker }}
+          path: "*.ndjson.gz"
+          retention-days: 1
+          if-no-files-found: warn
+
       - name: Upload Worker Timings
-        # Each region's own ndjson.gz is already published individually
-        # (see the per-region "node -e" upload in build_region_ndjson
-        # above) - this is just the small per-worker timing summary, still
-        # cheap to bundle. "warn" because a worker whose very first claim
-        # already failed permanently may legitimately produce zero files.
+        # Small per-worker timing summary, cheap to bundle. "warn" because
+        # a worker whose very first claim already failed permanently may
+        # legitimately produce zero files.
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -841,8 +788,13 @@ jobs:
     # inconsistent versions of the same tile. Because z8-14 tiles nest
     # exactly inside their TILE_GRID_ZOOM ancestor cell, sharding by grid
     # cell instead means no two work units can ever produce the same z8-14
-    # tile - build-tiles-highzoom just needs every region whose data could
-    # fall inside a cell gathered before tiling it.
+    # tile. build-tiles-highzoom downloads the whole combined world land
+    # stream once (see combine-land-data) and clips it to each claimed
+    # cell's exact bounds, so this job's own role is just picking which
+    # cells are worth tiling at all: the region-bbox overlap test below only
+    # decides that (skipping pure-ocean cells with no overlapping region)
+    # and feeds the largest-estimate-first ordering - it no longer needs to
+    # track which specific regions overlap each cell.
     #
     # `!cancelled()` (not just the debug_run_id check) matters here the same
     # way it does for combine-land-data/update-timings: build-tiles-ndjson
@@ -901,8 +853,8 @@ jobs:
 
           # The union of every worker's timed regions is exactly the set
           # that finished phase 1 successfully - a region that failed there
-          # never got a timing entry, and never published an ndjson artifact
-          # for build-tiles-highzoom to fetch either.
+          # never got a timing entry, and never made it into its worker's
+          # ndjson bundle either.
           elapsed = {}
           for path in sorted(glob.glob("download_ndjson_timings/timings-ndjson-worker-*.json")):
               with open(path) as f:
@@ -970,6 +922,11 @@ jobs:
                       # time as a proxy, same two-tier fallback chain
                       # `prepare-region-queue` uses for regions.
                       estimate = sum(elapsed.get(r, 0) for r in regions)
+                  # `regions` only feeds the estimate above and the log line
+                  # below - build-tiles-highzoom clips the whole combined
+                  # world stream to this cell's bounds rather than fetching
+                  # specific regions, so it isn't part of the published
+                  # work unit itself.
                   work_units.append({"tile": tile_id, "regions": regions, "estimate": estimate})
 
           # Sorted largest-first, same largest-estimate-first philosophy as
@@ -980,8 +937,11 @@ jobs:
           for u in work_units:
               print(f"  {u['tile']}: ~{u['estimate']:.0f}s estimated, {len(u['regions'])} region(s)")
 
+          # A flat list of tile IDs, same plain-list shape as
+          # prepare-region-queue's region queue - see the comment above for
+          # why `regions` doesn't need to travel with each entry anymore.
           with open("queue.json", "w") as f:
-              json.dump([{"tile": u["tile"], "regions": u["regions"]} for u in work_units], f)
+              json.dump([u["tile"] for u in work_units], f)
           PYEOF
 
       - name: Publish Tile Queue for This Run
@@ -1001,20 +961,29 @@ jobs:
   build-tiles-highzoom:
     # Phase 2 of 2 (see build-tiles-ndjson above): claims tile-grid work
     # units from its own tile-queue (seeded by prepare-tile-queue) and tiles
-    # each one's z8-14 shard from the union of every region whose data could
-    # fall inside that grid cell. A second, independent dynamic queue -
-    # rather than reusing build-tiles-ndjson's worker assignment 1:1 -
-    # because tiling cost doesn't track ndjson-build cost well (see the
-    # TILE_QUEUE_BRANCH comment at the top of this file), so a fixed
-    # per-worker split here could leave some workers idle while others work
-    # through a slow-to-tile backlog they can't shed. Sharding by grid cell
-    # rather than by region (see prepare-tile-queue) also means no two work
-    # units can ever produce the same z8-14 output tile, eliminating the
+    # each one's z8-14 shard by clipping it out of the whole combined world
+    # land stream (downloaded once from combine-land-data, see the
+    # "Download Combined Land Data" step below) to that cell's exact
+    # bounds. A second, independent dynamic queue - rather than reusing
+    # build-tiles-ndjson's worker assignment 1:1 - because tiling cost
+    # doesn't track ndjson-build cost well (see the TILE_QUEUE_BRANCH
+    # comment at the top of this file), so a fixed per-worker split here
+    # could leave some workers idle while others work through a
+    # slow-to-tile backlog they can't shed. Sharding by grid cell rather
+    # than by region (see prepare-tile-queue) also means no two work units
+    # can ever produce the same z8-14 output tile, eliminating the
     # cross-region simplification-seam problem the old per-region sharding
     # had. Skip entirely if a debug run ID is provided, same as
     # build-tiles-ndjson.
-    if: ${{ github.event.inputs.debug_run_id == '' }}
-    needs: [prepare-tile-queue]
+    #
+    # `!cancelled()` matters here for the same reason it does for
+    # prepare-tile-queue: combine-land-data (now a direct dependency, for
+    # its combined-stream artifact) deliberately exits non-zero whenever
+    # some region archives were corrupt, while still uploading whatever DID
+    # combine successfully - without an explicit status function this job
+    # would otherwise be skipped entirely whenever that happens.
+    if: ${{ !cancelled() && github.event.inputs.debug_run_id == '' }}
+    needs: [prepare-tile-queue, combine-land-data]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1025,19 +994,8 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Export Artifact Runtime Env Vars for Per-Region node Scripts
-        # See build-tiles-ndjson's identical step for why this is needed:
-        # ACTIONS_RUNTIME_TOKEN isn't visible to a plain `run:` step without
-        # first being re-exported from inside a `uses:` action's process.
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env['ACTIONS_RESULTS_URL'])
-            core.exportVariable('ACTIONS_RUNTIME_URL', process.env['ACTIONS_RUNTIME_URL'])
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env['ACTIONS_RUNTIME_TOKEN'])
-
       - name: Install GDAL
-        # Needed to clip a claimed tile's combined regions down to that
+        # Needed to clip the combined world land stream down to a claimed
         # tile's exact bbox (ogr2ogr -f GeoJSONSeq, see tile_work_unit
         # below) - build-tiles-ndjson already installs this for its own
         # per-region clip, this job needs its own copy since it's a
@@ -1056,13 +1014,15 @@ jobs:
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
-      - name: Install Per-Region Artifact Downloader
-        # Symmetric with build-tiles-ndjson's per-region uploader: fetching
-        # a specific region's ndjson artifact by a name only known at
-        # runtime (whatever regions this worker's claimed tile needs) can't
-        # be expressed as a static actions/download-artifact step, so it's
-        # done via the same @actions/artifact SDK directly instead.
-        run: npm install --no-save @actions/artifact@^2
+      - name: Download Combined Land Data
+        # The whole world's clipped, water-erased land geometry, already
+        # concatenated once by combine-land-data - downloaded here exactly
+        # once per worker job (not per claimed tile) and reused by every
+        # tile this worker tiles for the rest of the job, each clipped down
+        # to its own cell's bounds in tile_work_unit below.
+        uses: actions/download-artifact@v4
+        with:
+          name: world-land-ndjson
 
       - name: Configure Git Identity for Queue Claims
         run: |
@@ -1081,29 +1041,28 @@ jobs:
 
           # Same optimistic commit-and-push claim pattern as
           # build-tiles-ndjson's claim_region, against the tile queue
-          # instead of the region queue. Each entry is now a
-          # {"tile": "z/x/y", "regions": [...]} object rather than a plain
-          # region string, but `.[0]`/`.[1:]` slice objects the same way.
+          # instead of the region queue. Each entry is now a plain tile-ID
+          # string ("z/x/y"), same shape as the region queue, so
+          # `.[0]`/`.[1:]` slice it the same way too.
           claim_tile() {
             for attempt in $(seq 1 10); do
               git fetch origin "$TILE_QUEUE_BRANCH" -q
               git checkout -q -B "$TILE_QUEUE_BRANCH" "origin/$TILE_QUEUE_BRANCH"
 
-              local queue_len claimed tile
+              local queue_len tile
               queue_len=$(jq 'length' queue.json)
               if [ "$queue_len" -eq 0 ]; then
                 return 1
               fi
 
-              claimed=$(jq -c '.[0]' queue.json)
-              tile=$(echo "$claimed" | jq -r '.tile')
+              tile=$(jq -r '.[0]' queue.json)
               jq '.[1:]' queue.json > queue.json.next && mv queue.json.next queue.json
 
               git add queue.json
               git commit -q -m "chore: claim $tile"
 
               if git push origin "$TILE_QUEUE_BRANCH" -q 2>/dev/null; then
-                echo "$claimed"
+                echo "$tile"
                 return 0
               fi
               echo "Lost the claim race on attempt $attempt, retrying..." >&2
@@ -1112,72 +1071,24 @@ jobs:
             return 1
           }
 
-          # Mirrors build-tiles-ndjson's publish_ndjson_artifact: the
-          # @actions/artifact SDK can fail transiently (e.g. ETIMEDOUT) the
-          # same as any other network call, so retry with backoff rather than
-          # failing the whole tile over one flaky request.
-          fetch_ndjson_artifact() {
-            local region_slug="$1"
-            local max_attempts=5 wait_seconds=15 attempt=1
-            while true; do
-              if node -e "
-                const { DefaultArtifactClient } = require('@actions/artifact');
-                (async () => {
-                  const client = new DefaultArtifactClient();
-                  const { artifact } = await client.getArtifact('ndjson-${region_slug}');
-                  await client.downloadArtifact(artifact.id, { path: '.' });
-                })().catch((err) => { console.error(err); process.exit(1); });
-              "; then
-                return 0
-              fi
-              if [ "$attempt" -ge "$max_attempts" ]; then
-                echo "Giving up fetching ndjson-${region_slug} after $attempt attempts."
-                return 1
-              fi
-              echo "Artifact download attempt $attempt/$max_attempts for ndjson-${region_slug} failed (transient error, e.g. ETIMEDOUT). Retrying in ${wait_seconds}s..."
-              sleep "$wait_seconds"
-              attempt=$((attempt + 1))
-              wait_seconds=$((wait_seconds * 2))
-            done
-          }
-
           tile_work_unit() {
-            local CLAIMED="$1"
+            local TILE="$1"
             local START_TIME=$SECONDS
-            local TILE; TILE=$(echo "$CLAIMED" | jq -r '.tile')
             local TILE_SLUG; TILE_SLUG=$(echo "$TILE" | tr '/' '-')
             local Z X Y
             IFS='/' read -r Z X Y <<< "$TILE"
 
-            echo "1/3 Fetch — downloading ndjson for every region in tile $TILE..."
-            # Mirrors build-tiles-ndjson's per-region upload: this worker
-            # fetches exactly the regions this tile needs, on demand, rather
-            # than every worker bulk-downloading every region's data up
-            # front. NDJSON files concatenate safely by construction (the
-            # same property combine-land-data relies on), so every fetched
-            # region's file is just appended into one local stream.
-            : > combined.ndjson
-            while IFS= read -r REGION; do
-              local REGION_SLUG; REGION_SLUG=$(echo "$REGION" | tr '/' '-')
-              local FILENAME="${REGION_SLUG}.ndjson.gz"
-              fetch_ndjson_artifact "$REGION_SLUG" || {
-                echo "Couldn't fetch $REGION's ndjson artifact for tile $TILE."; return 1;
-              }
-
-              gunzip -c "$FILENAME" >> combined.ndjson || {
-                echo "Couldn't decompress $REGION's ndjson artifact for tile $TILE."; return 1;
-              }
-              rm -f "$FILENAME"
-            done < <(echo "$CLAIMED" | jq -r '.regions[]')
-
-            echo "2/3 Clip — cropping the combined geometry to tile $TILE's exact bounds..."
+            echo "1/2 Clip — cropping the combined world geometry to tile $TILE's exact bounds..."
             # Grid-cell bounds computed the same way prepare-tile-queue
             # computed them (standard Web Mercator slippy-tile math), so
             # every z8-14 descendant tile this produces falls entirely
             # inside this one grid cell - no other work unit can ever emit
             # the same z8-14 tile. That's what actually fixes the
             # cross-region simplification-seam problem (see the top of this
-            # file), not a tippecanoe flag.
+            # file), not a tippecanoe flag. world_land.ndjson is the whole
+            # combined-world stream downloaded once above (see "Download
+            # Combined Land Data") - shared and re-clipped fresh for every
+            # tile this worker claims, never modified in place.
             # A single-line python -c invocation (not a multi-line one) -
             # deliberately, since this is nested inside a bash function
             # inside the run: block: a multi-line -c/heredoc script's
@@ -1188,12 +1099,12 @@ jobs:
             # do without looking actively misleading - a one-liner sidesteps
             # the whole question.
             local BOUNDS; BOUNDS=$(python3 -c "import math; n = 2 ** $Z; print($X / n * 360.0 - 180.0, math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * ($Y + 1) / n)))), ($X + 1) / n * 360.0 - 180.0, math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * $Y / n)))))")
-            ogr2ogr -f GeoJSONSeq clipped.ndjson combined.ndjson \
+            ogr2ogr -f GeoJSONSeq clipped.ndjson world_land.ndjson \
               -clipsrc $BOUNDS -makevalid || {
               echo "Clip step failed for tile $TILE."; return 1;
             }
 
-            echo "3/3 Temper — tiling tile $TILE's high-zoom (z8-14) shard..."
+            echo "2/2 Temper — tiling tile $TILE's high-zoom (z8-14) shard..."
             # -pS exempts the deepest zoom (14) from --simplification=10,
             # same as the original single-build design this replaced.
             tippecanoe -P -U 60 --force \
@@ -1217,19 +1128,21 @@ jobs:
           }
 
           while true; do
-            CLAIMED=$(claim_tile) || break
-            TILE=$(echo "$CLAIMED" | jq -r '.tile')
+            TILE=$(claim_tile) || break
 
             echo "Claimed tile $TILE"
 
-            if ! tile_work_unit "$CLAIMED"; then
+            if ! tile_work_unit "$TILE"; then
               echo "::error::Tile $TILE failed - discarding it, moving on to the next tile."
               echo "| \`$TILE\` | — | failed |" >> $GITHUB_STEP_SUMMARY
               FAILED_TILES+=("$TILE")
             fi
 
-            # Clear the workbench so the loop doesn't fill up the disk.
-            rm -f combined.ndjson clipped.ndjson ./*.ndjson.gz
+            # Clear the workbench so the loop doesn't fill up the disk. Only
+            # this tile's own clipped output - world_land.ndjson is the
+            # shared combined stream downloaded once for the whole job and
+            # must persist across every tile this worker claims.
+            rm -f clipped.ndjson
           done
 
           if [ ${#FAILED_TILES[@]} -gt 0 ]; then
@@ -1464,13 +1377,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download Land Geometry (Standard Workflow Execution)
-        # Each region published its own ndjson artifact individually (see
-        # build-tiles-ndjson) rather than one bundle per worker; the `ndjson-*`
-        # pattern below still collects all of them in one merge-multiple call.
+        # Each build-tiles-ndjson worker published one bundled artifact
+        # (ndjson-worker-N) holding every region it finished; the
+        # `ndjson-worker-*` pattern below collects all workers' bundles in
+        # one merge-multiple call.
         if: ${{ github.event.inputs.debug_run_id == '' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: ndjson-*
+          pattern: ndjson-worker-*
           path: download_ndjson
           merge-multiple: true
 
@@ -1478,7 +1392,7 @@ jobs:
         if: ${{ github.event.inputs.debug_run_id != '' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: ndjson-*
+          pattern: ndjson-worker-*
           path: download_ndjson
           merge-multiple: true
           run-id: ${{ github.event.inputs.debug_run_id }}
