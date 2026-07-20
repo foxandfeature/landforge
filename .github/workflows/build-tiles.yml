@@ -1014,11 +1014,7 @@ jobs:
     # had. Skip entirely if a debug run ID is provided, same as
     # build-tiles-ndjson.
     if: ${{ github.event.inputs.debug_run_id == '' }}
-<<<<<<< HEAD
     needs: [prepare-tile-queue]
-=======
-    needs: [prepare-region-queue, setup-tools, prepare-tile-queue]
->>>>>>> ae02e4459cb9870e9d2024272fd81c7113b05f28
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
