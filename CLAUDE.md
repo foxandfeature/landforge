@@ -17,8 +17,8 @@ Repo-tracked files:
   from automatic `ALL_REGIONS` runs but can still be targeted by an explicit manual run against
   that exact region (with a warning). Remove an entry once Geofabrik fixes the underlying file.
 - `regions.json` (being removed) — a formerly hand-maintained snapshot of Geofabrik's region
-  list. It's superseded by fetching Geofabrik's live `index-v1-nogeom.json` at `prepare` time
-  (see below), so the candidate region list never drifts out of date.
+  list. It's superseded by fetching Geofabrik's live `index-v1-nogeom.json` at
+  `prepare-region-queue` time (see below), so the candidate region list never drifts out of date.
 
 ## Running / testing changes
 
@@ -57,12 +57,13 @@ A top-level `concurrency` group serializes entire workflow runs so two runs neve
 these branches or the shared caches.
 
 Region processing is split into two phases, each with its own worker pool and its own dynamic
-work queue: **`build-tiles-ndjson`** (download/clip/erase → NDJSON, still sharded per Geofabrik
-region) and **`build-tiles-highzoom`** (NDJSON → tiled `z8-14` shard, sharded per **tile-grid
+work queue: **`build-tiles-ndjson`** (download/clip/erase → NDJSON, sharded per Geofabrik region)
+and **`build-tiles-highzoom`** (combined NDJSON → tiled `z8-14` shard, sharded per **tile-grid
 cell** instead — see below for why). They're separate jobs — not just separate steps in one job —
-specifically so `combine-land-data`/`build-low-zoom-pmtiles` (which only need the NDJSON) can run
-concurrently with tiling instead of waiting for it, since GitHub Actions can only gate a
-downstream job on an entire upstream job finishing, not on an individual step.
+because GitHub Actions can only gate a downstream job on an entire upstream job finishing, not on
+an individual step, and `build-low-zoom-pmtiles` needs to run concurrently with
+`build-tiles-highzoom` once both of their shared prerequisite (`combine-land-data`) is done, rather
+than waiting on tiling to finish first.
 
 **Why tiling shards by a coarse tile-grid cell (`TILE_GRID_ZOOM`, default z=4, 256 cells) instead
 of by region:** two regions that are geographic neighbors can both contribute features to the same
@@ -71,37 +72,35 @@ shard decided simplification/`--drop-smallest-as-needed` using only its own slic
 tile - `tile-join` then had to merge two independently-simplified, potentially inconsistent
 versions of it. Because z8-14 tiles nest exactly inside their `TILE_GRID_ZOOM` ancestor cell
 (integer division of the tile coordinates), sharding by grid cell instead means no two work units
-can ever produce the same z8-14 tile - a work unit for cell `T` just needs every region whose bbox
-overlaps `T` gathered before tiling, so simplification for a tile always sees everything that
-could land in it. This also means tiling can no longer use a fixed 1:1 worker assignment from
-phase 1 (tiling cost per cell doesn't track any single region's ndjson-build cost), so it gets its
-own dynamic queue (`tile-queue`, seeded by `prepare-tile-queue`) exactly like phase 1 has for
-regions.
+can ever produce the same z8-14 tile - each `build-tiles-highzoom` worker downloads the *whole*
+combined world land stream once (published by `combine-land-data`) and just clips it fresh to
+whichever cell it claims, so simplification for a tile always sees everything that could land in
+it. This also means tiling can no longer use a fixed 1:1 worker assignment from phase 1 (tiling
+cost per cell doesn't track any single region's ndjson-build cost), so it gets its own dynamic
+queue (`tile-queue`, seeded by `prepare-tile-queue`) exactly like phase 1 has for regions.
 
-To let any `build-tiles-highzoom` worker claim any tile without every worker having to
-bulk-download every region's NDJSON up front, `build-tiles-ndjson` publishes each region's NDJSON
-(and bbox) as its **own** artifact (`ndjson-<region-slug>`) rather than one bundle per worker; both
-the per-region publish and the on-demand per-region fetch (potentially several per claimed tile)
-are done via a small inline Node script against the `@actions/artifact` SDK, since GitHub's
-`upload-artifact`/`download-artifact` steps can't be parameterized by a name computed at runtime
-inside a bash loop. That SDK needs `ACTIONS_RUNTIME_TOKEN`/`ACTIONS_RESULTS_URL`/
-`ACTIONS_RUNTIME_URL` to authenticate, which GitHub only injects into the process of an action
-invoked via `uses:` (how `actions/upload-artifact` itself gets away with reading them), not into a
-plain `run:` step's environment - so both `build-tiles-ndjson` and `build-tiles-highzoom` run one
-`actions/github-script@v7` step early that reads those hidden vars and re-exports them via
-`core.exportVariable` into `$GITHUB_ENV`, making them ordinary env vars for the rest of the job.
+Because every worker clips its own copy of the same combined stream rather than fetching specific
+regions per tile, `prepare-tile-queue` doesn't need to know which regions overlap which cell either
+- it just enumerates every one of the `TILE_GRID_ZOOM` grid's cells as a work unit. A cell that
+turns out to be pure ocean isn't filtered out ahead of time; `build-tiles-highzoom` discovers that
+itself when the per-cell clip comes back empty and skips tiling it on the spot (see
+`tile_work_unit`'s `[ ! -s clipped.ndjson ]` check) - cheap enough that predicting it up front
+isn't worth the extra machinery. An earlier design instead had `build-tiles-ndjson` publish each
+region's bbox alongside its NDJSON so `prepare-tile-queue` could bbox-overlap-test every region
+against every cell and drop non-overlapping ones; that's gone now that tiling clips from one
+combined download instead of fetching per-region artifacts on demand.
 
-1. **`prepare`** — fetches Geofabrik's live region index (`index-v1-nogeom.json`) instead of
-   using a repo-committed list, derives the leaf regions that have their own shapefile,
+1. **`prepare-region-queue`** — fetches Geofabrik's live region index (`index-v1-nogeom.json`)
+   instead of using a repo-committed list, derives the leaf regions that have their own shapefile,
    filters out `known_broken_regions.json` (for `ALL_REGIONS`/scheduled runs only), estimates
    per-region time from `region_timings.json` history, sorts regions **largest-estimate-first**,
    and publishes that sorted list as `queue.json` on the `region-queue` branch. Also decides
-   the worker pool size (up to 20, capped by region count) — reused by `build-tiles-highzoom` too.
+   the worker pool size (`NUM_WORKERS`, up to 20, capped by region count).
 
-2. **`setup-tools`** (parallel to `prepare`) — builds/caches Tippecanoe from source (cache keyed
-   on its latest upstream commit hash) and downloads/caches the global OSM land polygons
-   (`land-polygons-split-4326`, cache keyed by month so it refreshes roughly in step with the
-   monthly cron).
+2. **`setup-tools`** (parallel to `prepare-region-queue`) — builds/caches Tippecanoe from source
+   (cache keyed on its latest upstream commit hash) and downloads/caches the global OSM land
+   polygons (`land-polygons-split-4326`, cache keyed by month so it refreshes roughly in step with
+   the monthly cron).
 
 3. **`build-tiles-ndjson`** — a matrix of workers (`strategy.matrix.worker`, `fail-fast: false`).
    Each worker loops: **claim** the region at the front of `region-queue` (optimistic
@@ -118,12 +117,10 @@ plain `run:` step's environment - so both `build-tiles-ndjson` and `build-tiles-
    - `mapshaper -erase` the filtered water out of the clipped land, writing **newline-delimited**
      GeoJSON (`format=geojson ndjson` is required — a plain FeatureCollection would break the
      later global concatenation and Tippecanoe's streaming parser).
-   - gzip the NDJSON, verify the archive isn't corrupt, and publish it as its own artifact
-     (`ndjson-<region-slug>`, see above), plus this region's bbox (computed while parsing
-     `region.poly`) into a per-worker `region-bboxes-worker-N` artifact — consumed by
-     `combine-land-data` (the raw, unclipped-detail geometry for the global low-zoom pass),
-     `prepare-tile-queue` (the bbox, for its region-to-tile-grid overlap test), and
-     `build-tiles-highzoom` (the NDJSON, tiled into whichever grid cell(s) it overlaps).
+   - gzip the NDJSON and verify the archive isn't corrupt. Every region a worker finishes stays in
+     its own workspace as `<slug>.ndjson.gz` rather than being published individually; the whole
+     batch is bundled into one `ndjson-worker-N` artifact at the end of the job instead, consumed
+     by `combine-land-data` (and, indirectly through that combined stream, `build-tiles-highzoom`).
    - Every step is explicitly checked with `|| return 1` rather than relying on `set -e`,
      because this function is invoked as `if ! build_region_ndjson ...` — bash suppresses
      `errexit` for the entire duration of any command tested by `if`/`!`, including inside called
@@ -131,52 +128,50 @@ plain `run:` step's environment - so both `build-tiles-ndjson` and `build-tiles-
      as if the region had succeeded.
    - A failed region is logged and skipped; it does not fail the whole worker or block other
      regions.
-   - Worker artifacts (`region-timings-ndjson-worker-N`, `region-bboxes-worker-N`) are uploaded
-     with `if: always()` so partial progress survives even if the worker's loop ultimately exits
+   - Worker artifacts (`ndjson-worker-N`, `region-timings-ndjson-worker-N`) are uploaded with
+     `if: always()` so partial progress survives even if the worker's loop ultimately exits
      non-zero.
 
-4. **`prepare-tile-queue`** — downloads every `build-tiles-ndjson` worker's timings and bboxes;
-   the union of timed regions is exactly the set that finished phase 1. Computes the
-   `TILE_GRID_ZOOM` grid's cell bounds (standard Web Mercator slippy-tile math), bbox-overlap-tests
-   every region against every cell to build each cell's region list, and drops cells with no
-   overlapping regions (pure ocean). Estimates each remaining cell's workload from
-   `tile_timings.json` history if available, falling back to the sum of its regions' this-run
-   ndjson elapsed times otherwise (same two-tier fallback `prepare` uses for regions), sorts
-   **largest-estimate-first**, and publishes `queue.json` (a list of `{"tile": "z/x/y", "regions":
-   [...]}` objects) on `tile-queue`.
+4. **`prepare-tile-queue`** — enumerates every cell of the `TILE_GRID_ZOOM` grid (a pure function
+   of that env var, independent of which regions succeeded in phase 1 - see above for why),
+   estimates each cell's workload from `tile_timings.json` history (falling back to `0`, which
+   just sorts it after every cell with real history), sorts **largest-estimate-first**, and
+   publishes the flat list of `"z/x/y"` tile IDs as `queue.json` on `tile-queue`.
 
 5. **`build-tiles-highzoom`** — a second matrix of workers, independent from `build-tiles-ndjson`'s.
-   Each worker loops: **claim** a tile-grid work unit from `tile-queue`, fetch every one of its
-   listed regions' `ndjson-<region-slug>` artifacts on demand and concatenate them (NDJSON files
-   concatenate safely by construction), clip the combined stream to the tile's exact bbox
-   (`ogr2ogr -f GeoJSONSeq -clipsrc`), then tile it into that cell's own `z8-14` PMTiles shard
-   (`-pS --simplification=10 --drop-smallest-as-needed`). `-pS` exempts the deepest zoom (14) from
-   `--simplification=10`. Because z8-14 tiles nest exactly inside their grid-cell ancestor, no two
-   work units can ever emit the same z8-14 tile (see `build-low-zoom-pmtiles` below for why the low
-   zoom range still needs a genuinely global view instead). Worker artifacts (`highzoom-worker-N`,
-   bundling every cell's own `.pmtiles` shard this worker tiled, and
-   `tile-timings-highzoom-worker-N`) are uploaded with `if: always()`.
+   Each worker downloads the whole `world-land-ndjson` combined stream (published by
+   `combine-land-data`) exactly once, then loops: **claim** a tile-grid cell from `tile-queue`,
+   clip that shared local copy down to the cell's exact bounds (`ogr2ogr -f GeoJSONSeq -clipsrc`),
+   and - unless the clip comes back empty (pure ocean, nothing to tile, logged and skipped) - tile
+   it into that cell's own `z8-14` PMTiles shard (`-pS --simplification=10
+   --drop-smallest-as-needed`). `-pS` exempts the deepest zoom (14) from `--simplification=10`.
+   Because z8-14 tiles nest exactly inside their grid-cell ancestor, no two work units can ever
+   emit the same z8-14 tile (see `build-low-zoom-pmtiles` below for why the low zoom range still
+   needs a genuinely global view instead). Worker artifacts (`highzoom-worker-N`, bundling every
+   cell's own `.pmtiles` shard this worker tiled, and `tile-timings-highzoom-worker-N`) are
+   uploaded with `if: always()`.
 
 6. **`cleanup-region-queue`** — deletes the `region-queue` branch once `build-tiles-ndjson` is
-   done (`prepare` recreates it fresh next run). **`cleanup-tile-queue`** does the same for
-   `tile-queue` once `build-tiles-highzoom` is done.
+   done (`prepare-region-queue` recreates it fresh next run). **`cleanup-tile-queue`** does the
+   same for `tile-queue` once `build-tiles-highzoom` is done.
 
 7. **`update-timings`** — merges every worker's phase-1 timings into `region_timings.json` (purely
-   ndjson-build time per region — the sole input to `prepare`'s region-queue ordering) and every
-   worker's phase-2 timings into `tile_timings.json` (per tile-grid cell — the input to
-   `prepare-tile-queue`'s ordering), both on the `region-timings` branch, keeping the last 5
-   samples each. These are two separate histories, not summed into one: a tile's tiling cost isn't
-   attributable to any single region once tiling shards by grid cell instead of by region. Pushes
-   with rebase-and-retry to handle races.
+   ndjson-build time per region — the sole input to `prepare-region-queue`'s region-queue
+   ordering) and every worker's phase-2 timings into `tile_timings.json` (per tile-grid cell — the
+   input to `prepare-tile-queue`'s ordering), both on the `region-timings` branch, keeping the last
+   5 samples each. These are two separate histories, not summed into one: a tile's tiling cost
+   isn't attributable to any single region once tiling shards by grid cell instead of by region.
+   Pushes with rebase-and-retry to handle races.
 
-8. **`combine-land-data`** — downloads every region's `ndjson-<region-slug>` artifact,
-   integrity-checks (`gzip -t`) and concatenates them into one `world_land.ndjson` stream. A
-   corrupted/truncated artifact is skipped with a warning rather than aborting the whole merge,
+8. **`combine-land-data`** — downloads every `build-tiles-ndjson` worker's bundled
+   `ndjson-worker-N` artifact, integrity-checks each region's archive (`gzip -t`) and concatenates
+   them into one `world_land.ndjson` stream, published as the single `world-land-ndjson` artifact.
+   A corrupted/truncated archive is skipped with a warning rather than aborting the whole merge,
    but the job still exits non-zero so it's visible, while still uploading the partial result
-   (`if: always()`) so `build-low-zoom-pmtiles` gets whatever succeeded. This stream only feeds
-   the low-zoom shard below — the `z8-14` shards never pass through it. Needs only
-   `build-tiles-ndjson` (not `build-tiles-highzoom`), so this job and `build-low-zoom-pmtiles` run
-   **concurrently with tiling** instead of waiting for it to finish first.
+   (`if: always()`) so downstream jobs get whatever succeeded. Needs only `build-tiles-ndjson` (not
+   `build-tiles-highzoom`); both `build-low-zoom-pmtiles` and `build-tiles-highzoom` need this
+   job's combined stream in turn (the low-zoom pass for its global view, tiling workers to clip
+   their own per-cell copies from), and run concurrently with each other once it's done.
 
 9. **`build-low-zoom-pmtiles`** — runs Tippecanoe once, globally, over the combined stream, but
    only for `z0-7` (`--simplification=10 --drop-smallest-as-needed`, uniformly across the whole
