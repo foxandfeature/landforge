@@ -401,11 +401,9 @@ jobs:
       - name: Create Python Helper Script
         run: |
           cat << 'EOF' > poly2wkt.py
-          import json, sys
+          import sys
           polygons = []
           current = []
-          minlon = minlat = float('inf')
-          maxlon = maxlat = float('-inf')
           # Read and parse Geofabrik .poly format lines into coordinates
           with open('region.poly') as f:
               for line in f.readlines()[1:]:
@@ -418,14 +416,9 @@ jobs:
                       continue
                   p = line.split()
                   if len(p) == 2:
-                      lon, lat = float(p[0]), float(p[1])
-                      minlon, maxlon = min(minlon, lon), max(maxlon, lon)
-                      minlat, maxlat = min(minlat, lat), max(maxlat, lat)
                       current.append(f"{p[0]} {p[1]}")
           wkt = f"MULTIPOLYGON({','.join(polygons)})" if len(polygons) > 1 else f"POLYGON{polygons[0]}"
           with open('boundary.wkt', 'w') as out: out.write(wkt)
-          # bbox feeds prepare-tile-queue's region-to-tile-grid overlap test.
-          with open('boundary.bbox.json', 'w') as out: json.dump([minlon, minlat, maxlon, maxlat], out)
           EOF
 
       - name: Configure Git Identity for Queue Claims
@@ -445,8 +438,6 @@ jobs:
 
           TIMINGS_FILE="timings-ndjson-worker-${{ matrix.worker }}.json"
           echo '{}' > "$TIMINGS_FILE"
-          BBOX_FILE="bboxes-worker-${{ matrix.worker }}.json"
-          echo '{}' > "$BBOX_FILE"
           FAILED_REGIONS=()
 
           # Claims the region at the front of the shared queue (largest
@@ -615,12 +606,6 @@ jobs:
             }
             python3 poly2wkt.py || { echo "Failed to parse $REGION's boundary.poly."; return 1; }
 
-            # Record this region's bbox for prepare-tile-queue's region-to-
-            # tile-grid overlap test, same jq-merge pattern as $TIMINGS_FILE.
-            jq --arg region "$REGION" --argjson b "$(cat boundary.bbox.json)" \
-              '. + {($region): $b}' "$BBOX_FILE" > "${BBOX_FILE}.tmp" \
-              && mv "${BBOX_FILE}.tmp" "$BBOX_FILE"
-
             echo "2/5 Skim — dropping glaciers and wetlands from the water layer..."
             # gis_osm_water_a_free_1 lumps open water together with glaciers
             # (8211) and wetlands (8221); neither is open water, so leaving
@@ -674,7 +659,7 @@ jobs:
             # worker's own workspace rather than published individually -
             # every region this worker finishes is bundled into one
             # ndjson-worker-N artifact at the end of the job instead, the
-            # same pattern already used for this worker's timings/bboxes.
+            # same pattern already used for this worker's timings.
             local FILENAME; FILENAME="${REGION_SLUG}.ndjson.gz"
             echo "5/5 Quench — compressing and packing the raw geometry..."
             gzip -c land_layer.ndjson > "$FILENAME" && gzip -t "$FILENAME" 2>/dev/null || {
@@ -706,7 +691,7 @@ jobs:
             fi
 
             # Clear the workbench so the loop doesn't fill up the disk.
-            rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* water_filtered.* boundary.wkt boundary.bbox.json land_layer.ndjson local_land.* wget_error.log
+            rm -f region.poly region.shp.zip gis_osm_water_a_free_1.* water_filtered.* boundary.wkt land_layer.ndjson local_land.* wget_error.log
           done
 
           if [ ${#FAILED_REGIONS[@]} -gt 0 ]; then
@@ -720,7 +705,7 @@ jobs:
         # Every region this worker finished is still sitting in the
         # workspace as its own <slug>.ndjson.gz (build_region_ndjson no
         # longer publishes them individually) - bundle them all into one
-        # artifact per worker, same pattern as the timings/bboxes uploads
+        # artifact per worker, same pattern as the timings upload
         # below. combine-land-data and (indirectly, via that combined
         # stream) build-tiles-highzoom both consume these bundles. "warn"
         # because a worker whose very first claim already failed
@@ -742,17 +727,6 @@ jobs:
         with:
           name: region-timings-ndjson-worker-${{ matrix.worker }}
           path: "timings-ndjson-worker-*.json"
-          retention-days: 1
-          if-no-files-found: warn
-
-      - name: Upload Worker Region Bboxes
-        # Feeds prepare-tile-queue's region-to-tile-grid overlap test. Same
-        # "warn" reasoning as the timings artifact above.
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: region-bboxes-worker-${{ matrix.worker }}
-          path: "bboxes-worker-*.json"
           retention-days: 1
           if-no-files-found: warn
 
@@ -790,11 +764,15 @@ jobs:
     # cell instead means no two work units can ever produce the same z8-14
     # tile. build-tiles-highzoom downloads the whole combined world land
     # stream once (see combine-land-data) and clips it to each claimed
-    # cell's exact bounds, so this job's own role is just picking which
-    # cells are worth tiling at all: the region-bbox overlap test below only
-    # decides that (skipping pure-ocean cells with no overlapping region)
-    # and feeds the largest-estimate-first ordering - it no longer needs to
-    # track which specific regions overlap each cell.
+    # cell's exact bounds, so this job's own role reduces to enumerating
+    # every grid cell up front and ordering them largest-estimate-first
+    # from tile_timings.json history. The grid is a pure function of
+    # TILE_GRID_ZOOM, so unlike the old per-region-bbox design, this no
+    # longer needs any per-region data from build-tiles-ndjson to decide
+    # which cells to queue - pure-ocean cells are cheap to claim and are
+    # skipped on the spot by build-tiles-highzoom once their clip against
+    # the combined stream comes back empty (see tile_work_unit), instead
+    # of being predicted and filtered out here.
     #
     # `!cancelled()` (not just the debug_run_id check) matters here the same
     # way it does for combine-land-data/update-timings: build-tiles-ndjson
@@ -828,42 +806,12 @@ jobs:
             echo "The $TIMINGS_BRANCH branch doesn't exist yet - starting with empty tile timings."
           fi
 
-      - name: Download Per-Worker NDJSON-Phase Timings
-        uses: actions/download-artifact@v4
-        continue-on-error: true # no artifacts if every worker failed before finishing a single region
-        with:
-          pattern: region-timings-ndjson-worker-*
-          path: download_ndjson_timings
-          merge-multiple: true
-
-      - name: Download Per-Worker Region Bboxes
-        uses: actions/download-artifact@v4
-        continue-on-error: true # same reasoning as the timings download above
-        with:
-          pattern: region-bboxes-worker-*
-          path: download_bboxes
-          merge-multiple: true
-
       - name: Compute the Tile Grid and Publish Tile Work Units
         run: |
           python3 << 'PYEOF'
-          import glob, json, math, os
+          import json, os
 
           ZOOM = int(os.environ["TILE_GRID_ZOOM"])
-
-          # The union of every worker's timed regions is exactly the set
-          # that finished phase 1 successfully - a region that failed there
-          # never got a timing entry, and never made it into its worker's
-          # ndjson bundle either.
-          elapsed = {}
-          for path in sorted(glob.glob("download_ndjson_timings/timings-ndjson-worker-*.json")):
-              with open(path) as f:
-                  elapsed.update(json.load(f))
-
-          bboxes = {}
-          for path in sorted(glob.glob("download_bboxes/bboxes-worker-*.json")):
-              with open(path) as f:
-                  bboxes.update(json.load(f))
 
           with open("tile_timings.json") as f:
               tile_timings = json.load(f)
@@ -879,67 +827,30 @@ jobs:
 
           tile_averages = {t: avg_of(v) for t, v in tile_timings.items()}
 
-          def tile_bbox(z, x, y):
-              # Standard Web Mercator slippy-tile bounds. y=0 is the
-              # northmost row, so lat_max comes from y and lat_min from
-              # y+1.
-              n = 2 ** z
-              lon_min = x / n * 360.0 - 180.0
-              lon_max = (x + 1) / n * 360.0 - 180.0
-              def lat(yf):
-                  return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * yf / n))))
-              return (lon_min, lat(y + 1), lon_max, lat(y))
-
-          def overlaps(a, b):
-              # bbox-vs-bbox overlap - a conservative superset test. A
-              # region's true shape is always contained in its own bbox, so
-              # this never misses a real overlap; it can only occasionally
-              # include a region that doesn't actually touch a cell, which
-              # just costs a wasted clip later, not a correctness gap.
-              aminlon, aminlat, amaxlon, amaxlat = a
-              bminlon, bminlat, bmaxlon, bmaxlat = b
-              return aminlon <= bmaxlon and amaxlon >= bminlon and aminlat <= bmaxlat and amaxlat >= bminlat
-
-          # A region that finished phase 1 but whose bbox artifact is
-          # somehow missing (shouldn't happen - both are written together in
-          # build_region_ndjson) is excluded from every tile rather than
-          # crashing the whole queue computation.
-          regions_with_bbox = [r for r in elapsed if r in bboxes]
-
+          # Every grid cell is queued - the grid is a pure function of
+          # TILE_GRID_ZOOM, so there's no need for per-region data here to
+          # decide which cells are worth tiling. A pure-ocean cell just
+          # means build-tiles-highzoom's clip of the combined world stream
+          # comes back empty, which it detects and skips on the spot
+          # (see tile_work_unit) - cheap enough that predicting it here
+          # isn't worth the extra machinery.
           n = 2 ** ZOOM
-          work_units = []
-          for x in range(n):
-              for y in range(n):
-                  tb = tile_bbox(ZOOM, x, y)
-                  regions = [r for r in regions_with_bbox if overlaps(bboxes[r], tb)]
-                  if not regions:
-                      continue  # pure ocean/empty cell - nothing to fetch or tile
-                  tile_id = f"{ZOOM}/{x}/{y}"
-                  estimate = tile_averages.get(tile_id)
-                  if estimate is None:
-                      # No tiling history for this cell yet - fall back to
-                      # this run's fresh sum of its regions' ndjson-build
-                      # time as a proxy, same two-tier fallback chain
-                      # `prepare-region-queue` uses for regions.
-                      estimate = sum(elapsed.get(r, 0) for r in regions)
-                  # `regions` only feeds the estimate above and the log line
-                  # below - build-tiles-highzoom clips the whole combined
-                  # world stream to this cell's bounds rather than fetching
-                  # specific regions, so it isn't part of the published
-                  # work unit itself.
-                  work_units.append({"tile": tile_id, "regions": regions, "estimate": estimate})
+          work_units = [
+              {"tile": f"{ZOOM}/{x}/{y}", "estimate": tile_averages.get(f"{ZOOM}/{x}/{y}", 0)}
+              for x in range(n)
+              for y in range(n)
+          ]
 
           # Sorted largest-first, same largest-estimate-first philosophy as
-          # `prepare-region-queue`'s region-queue.
+          # `prepare-region-queue`'s region-queue. Cells with no tiling
+          # history yet (estimate 0 - every cell, on the very first run)
+          # simply sort after every cell that does.
           work_units.sort(key=lambda u: u["estimate"], reverse=True)
 
           print(f"Queued {len(work_units)} tile(s) (of {n * n} grid cells) for tiling:")
           for u in work_units:
-              print(f"  {u['tile']}: ~{u['estimate']:.0f}s estimated, {len(u['regions'])} region(s)")
+              print(f"  {u['tile']}: ~{u['estimate']:.0f}s estimated")
 
-          # A flat list of tile IDs, same plain-list shape as
-          # prepare-region-queue's region queue - see the comment above for
-          # why `regions` doesn't need to travel with each entry anymore.
           with open("queue.json", "w") as f:
               json.dump([u["tile"] for u in work_units], f)
           PYEOF
@@ -1103,6 +1014,21 @@ jobs:
               -clipsrc $BOUNDS -makevalid || {
               echo "Clip step failed for tile $TILE."; return 1;
             }
+
+            if [ ! -s clipped.ndjson ]; then
+              # Pure-ocean/empty cell - prepare-tile-queue queues every grid
+              # cell unconditionally (see its comment) rather than predicting
+              # this from region bboxes, so it's discovered here instead:
+              # nothing landed in this cell's bounds, so there's nothing to
+              # tile and no shard to emit for it.
+              echo "Tile $TILE's clip came back empty - nothing to tile, skipping."
+              local ELAPSED_TIME=$(( SECONDS - START_TIME ))
+              echo "| \`$TILE\` | $ELAPSED_TIME | empty |" >> $GITHUB_STEP_SUMMARY
+              jq --arg tile "$TILE" --argjson t "$ELAPSED_TIME" \
+                '. + {($tile): $t}' "$TIMINGS_FILE" > "${TIMINGS_FILE}.tmp" \
+                && mv "${TIMINGS_FILE}.tmp" "$TIMINGS_FILE"
+              return 0
+            fi
 
             echo "2/2 Temper — tiling tile $TILE's high-zoom (z8-14) shard..."
             # -pS exempts the deepest zoom (14) from --simplification=10,
