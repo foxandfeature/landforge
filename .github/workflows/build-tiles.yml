@@ -785,6 +785,7 @@ jobs:
     # though every region that DID finish phase 1 is still perfectly fine
     # to tile.
     if: ${{ !cancelled() && github.event.inputs.debug_run_id == '' }}
+    needs: [build-tiles-ndjson]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
