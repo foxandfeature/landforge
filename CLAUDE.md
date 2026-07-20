@@ -155,13 +155,19 @@ combined download instead of fetching per-region artifacts on demand.
    done (`prepare-region-queue` recreates it fresh next run). **`cleanup-tile-queue`** does the
    same for `tile-queue` once `build-tiles-highzoom` is done.
 
-7. **`update-timings`** — merges every worker's phase-1 timings into `region_timings.json` (purely
-   ndjson-build time per region — the sole input to `prepare-region-queue`'s region-queue
-   ordering) and every worker's phase-2 timings into `tile_timings.json` (per tile-grid cell — the
-   input to `prepare-tile-queue`'s ordering), both on the `region-timings` branch, keeping the last
-   5 samples each. These are two separate histories, not summed into one: a tile's tiling cost
-   isn't attributable to any single region once tiling shards by grid cell instead of by region.
-   Pushes with rebase-and-retry to handle races.
+7. **`update-region-timings`** and **`update-tile-timings`** — two separate jobs, each merging one
+   worker-timing history into its own file on the shared `region-timings` branch, keeping the last
+   5 samples each: `update-region-timings` merges every `build-tiles-ndjson` worker's phase-1
+   timings into `region_timings.json` (purely ndjson-build time per region — the sole input to
+   `prepare-region-queue`'s region-queue ordering), needing only `build-tiles-ndjson`;
+   `update-tile-timings` merges every `build-tiles-highzoom` worker's phase-2 timings into
+   `tile_timings.json` (per tile-grid cell — the input to `prepare-tile-queue`'s ordering), needing
+   only `build-tiles-highzoom`. These are two separate histories, not summed into one: a tile's
+   tiling cost isn't attributable to any single region once tiling shards by grid cell instead of
+   by region. Splitting the job in two (not just the histories) lets `update-region-timings` run
+   right after `build-tiles-ndjson` instead of waiting on the much longer tiling phase to finish
+   too, since it has nothing to do with tiling. Both jobs push to the same branch with
+   rebase-and-retry to handle races, including the case where the two land close together.
 
 8. **`combine-land-data`** — downloads every `build-tiles-ndjson` worker's bundled
    `ndjson-worker-N` artifact, integrity-checks each region's archive (`gzip -t`) and concatenates

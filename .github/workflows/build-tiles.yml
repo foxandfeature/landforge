@@ -29,8 +29,9 @@ permissions:
 env:
   # Dedicated orphan branches used purely as data/coordination stores, never
   # merged into main. TIMINGS_BRANCH is shared by prepare-region-queue,
-  # prepare-tile-queue, and update-timings (it holds both region_timings.json and
-  # tile_timings.json). QUEUE_BRANCH coordinates build-tiles-ndjson's
+  # prepare-tile-queue, update-region-timings, and update-tile-timings (it
+  # holds both region_timings.json and tile_timings.json). QUEUE_BRANCH
+  # coordinates build-tiles-ndjson's
   # per-region claims; TILE_QUEUE_BRANCH is a second, independent queue that
   # coordinates build-tiles-highzoom's claims of tile-grid work units. Two
   # separate queues (rather than reusing one) because tiling cost doesn't
@@ -73,7 +74,7 @@ jobs:
 
       - name: Fetch Region Timings from Dedicated Data Branch
         # region_timings.json lives on its own orphan branch (see
-        # update-timings) so its auto-generated commits never clutter main.
+        # update-region-timings) so its auto-generated commits never clutter main.
         run: |
           if git ls-remote --exit-code --heads origin "$TIMINGS_BRANCH" >/dev/null 2>&1; then
             git fetch --depth 1 origin "$TIMINGS_BRANCH"
@@ -197,8 +198,8 @@ jobs:
 
           def avg_of(history):
               # Averaging the last few measured durations (see
-              # update-timings), not just the latest one, keeps a single
-              # unusually slow/fast run from swinging the estimate alone.
+              # update-region-timings), not just the latest one, keeps a
+              # single unusually slow/fast run from swinging the estimate alone.
               if not history:
                   return None
               if not isinstance(history, list):
@@ -775,7 +776,7 @@ jobs:
     # of being predicted and filtered out here.
     #
     # `!cancelled()` (not just the debug_run_id check) matters here the same
-    # way it does for combine-land-data/update-timings: build-tiles-ndjson
+    # way it does for combine-land-data/update-region-timings/update-tile-timings: build-tiles-ndjson
     # deliberately exits non-zero whenever any individual region failed
     # (expected and normal across hundreds of regions, per this file's
     # failure-isolation convention), which without an explicit status
@@ -787,13 +788,15 @@ jobs:
     if: ${{ !cancelled() && github.event.inputs.debug_run_id == '' }}
     needs: [build-tiles-ndjson]
     runs-on: ubuntu-latest
+    outputs:
+      worker_ids: ${{ steps.tiles.outputs.worker_ids }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Fetch Tile Timings from Dedicated Data Branch
         # tile_timings.json lives alongside region_timings.json on the same
-        # orphan branch (see update-timings) - both are auto-generated
+        # orphan branch (see update-tile-timings) - both are auto-generated
         # commits kept off main. Falls back to empty both when the branch
         # doesn't exist yet AND when it exists but predates this file (e.g.
         # right after this feature is first deployed).
@@ -807,10 +810,18 @@ jobs:
           fi
 
       - name: Compute the Tile Grid and Publish Tile Work Units
+        id: tiles
+        env:
+          # Sized the same as prepare-region-queue's NUM_WORKERS - this is a
+          # second, independent worker pool (see build-tiles-highzoom), not
+          # a reuse of the phase-1 pool, so it gets its own cap rather than
+          # reading build-tiles-ndjson's worker count.
+          NUM_WORKERS: "20"
         run: |
           python3 << 'PYEOF'
           import json, os
 
+          NUM_WORKERS = int(os.environ["NUM_WORKERS"])
           ZOOM = int(os.environ["TILE_GRID_ZOOM"])
 
           with open("tile_timings.json") as f:
@@ -847,12 +858,17 @@ jobs:
           # simply sort after every cell that does.
           work_units.sort(key=lambda u: u["estimate"], reverse=True)
 
-          print(f"Queued {len(work_units)} tile(s) (of {n * n} grid cells) for tiling:")
+          num_workers = min(NUM_WORKERS, len(work_units)) or 1
+
+          print(f"Queued {len(work_units)} tile(s) (of {n * n} grid cells) for {num_workers} worker(s):")
           for u in work_units:
               print(f"  {u['tile']}: ~{u['estimate']:.0f}s estimated")
 
           with open("queue.json", "w") as f:
               json.dump([u["tile"] for u in work_units], f)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"worker_ids={json.dumps(list(range(num_workers)))}\n")
           PYEOF
 
       - name: Publish Tile Queue for This Run
@@ -899,7 +915,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        worker: ${{ fromJSON(needs.prepare-region-queue.outputs.worker_ids) }}
+        # prepare-tile-queue's own worker_ids, not prepare-region-queue's -
+        # this is a second, independent worker pool sized off the tile-grid
+        # cell count (see NUM_WORKERS there), and unlike prepare-region-queue
+        # it's already a direct `needs:` entry here, so its outputs actually
+        # resolve (see gha-needs-context-convention: never add a redundant
+        # `needs:` edge just to make an outputs reference resolve).
+        worker: ${{ fromJSON(needs.prepare-tile-queue.outputs.worker_ids) }}
 
     steps:
       - name: Checkout Repository
@@ -1044,7 +1066,7 @@ jobs:
             echo "Finished tile $TILE in ${ELAPSED_TIME}s."
             echo "| \`$TILE\` | $ELAPSED_TIME | done |" >> $GITHUB_STEP_SUMMARY
 
-            # Record this tile's duration - update-timings folds it into
+            # Record this tile's duration - update-tile-timings folds it into
             # tile_timings.json (separate history from region_timings.json,
             # since a tile's cost isn't attributable to any single region).
             jq --arg tile "$TILE" --argjson t "$ELAPSED_TIME" \
@@ -1121,17 +1143,23 @@ jobs:
             echo "$TILE_QUEUE_BRANCH branch is already gone - nothing to clean up."
           fi
 
-  update-timings:
+  update-region-timings:
     # Runs whenever build-tiles-ndjson executed and wasn't cancelled,
-    # deliberately not gated on it (or build-tiles-highzoom) fully
-    # succeeding: with per-region failure isolation, some regions can fail
-    # while others finish fine, and those timings are still worth keeping.
-    # A debug run skips both build-tiles-* jobs entirely, which the merge
-    # step below already handles gracefully. Only build-tiles-highzoom is
-    # listed below - it already needs build-tiles-ndjson transitively via
-    # prepare-tile-queue, so listing both here would just be a duplicate edge.
+    # deliberately not gated on it fully succeeding: with per-region failure
+    # isolation, some regions can fail while others finish fine, and those
+    # timings are still worth keeping. A debug run skips build-tiles-ndjson
+    # entirely, which the merge step below already handles gracefully.
+    #
+    # Split out from tile timings (see update-tile-timings) because the two
+    # fed genuinely separate histories already (region_timings.json vs
+    # tile_timings.json - see the TIMINGS_BRANCH comment at the top of this
+    # file) despite living in one job; splitting the job too means this one
+    # only needs build-tiles-ndjson, so it can run concurrently with
+    # prepare-tile-queue/build-tiles-highzoom/combine-land-data instead of
+    # waiting on the much longer tiling phase to finish first, even though
+    # it has nothing to do with tiling.
     if: ${{ !cancelled() }}
-    needs: [build-tiles-highzoom]
+    needs: [build-tiles-ndjson]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -1145,17 +1173,14 @@ jobs:
           path: download_ndjson_timings
           merge-multiple: true
 
-      - name: Download Per-Worker Tile-Phase Timings
-        uses: actions/download-artifact@v4
-        continue-on-error: true # no artifacts if every worker failed before finishing a single tile, or a debug run skipped build-tiles-highzoom
-        with:
-          pattern: tile-timings-highzoom-worker-*
-          path: download_tile_timings
-          merge-multiple: true
-
       - name: Switch to Dedicated Timings Branch
         # Keeps the timings file's auto-commits off main entirely: check out
         # the branch as-is if it exists, otherwise create it as an orphan.
+        # update-tile-timings does the same independently, for
+        # tile_timings.json on this same branch - each job's commit below
+        # only touches its own file, and the push retries with a rebase if
+        # the other job's push lands first (same pattern the region-queue/
+        # tile-queue claim loops already use for concurrent writers).
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -1172,11 +1197,11 @@ jobs:
 
       - name: Merge Region Timings
         # This is purely phase-1 (ndjson-build) time per region - the sole
-        # input to `prepare-region-queue`'s region-queue ordering. Tiling time
-        # is no longer attributable to a single region now that
+        # input to `prepare-region-queue`'s region-queue ordering. Tiling
+        # time is no longer attributable to a single region now that
         # build-tiles-highzoom shards by tile-grid cell (see
-        # prepare-tile-queue), so it's tracked separately below instead of
-        # being summed in here.
+        # prepare-tile-queue), so it's tracked separately by
+        # update-tile-timings instead of being summed in here.
         env:
           # How many recent measurements to keep per region -
           # prepare-region-queue averages over this history so one
@@ -1214,6 +1239,75 @@ jobs:
 
           print(f"region_timings.json now tracks {len(timings)} region(s).")
           PYEOF
+
+      - name: Commit Updated Region Timings
+        run: |
+          git add region_timings.json
+
+          if git diff --cached --quiet; then
+            echo "No timing changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update region processing timings"
+
+          for attempt in 1 2 3 4 5; do
+            if git ls-remote --exit-code --heads origin "$TIMINGS_BRANCH" >/dev/null 2>&1; then
+              git fetch origin "$TIMINGS_BRANCH"
+              if ! git rebase "origin/$TIMINGS_BRANCH"; then
+                git rebase --abort
+                echo "Rebase conflict on attempt $attempt, retrying in 5s..."
+                sleep 5
+                continue
+              fi
+            fi
+            if git push origin "HEAD:$TIMINGS_BRANCH"; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed, retrying in 5s..."
+            sleep 5
+          done
+          echo "Could not push updated region timings after 5 attempts."
+          exit 1
+
+  update-tile-timings:
+    # Mirrors update-region-timings above, but for tile_timings.json - see
+    # that job for why this is split out rather than one job handling both.
+    # Needs only build-tiles-highzoom (which already needs build-tiles-ndjson
+    # transitively via prepare-tile-queue, so listing both here would just be
+    # a duplicate edge).
+    if: ${{ !cancelled() }}
+    needs: [build-tiles-highzoom]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Per-Worker Tile-Phase Timings
+        uses: actions/download-artifact@v4
+        continue-on-error: true # no artifacts if every worker failed before finishing a single tile, or a debug run skipped build-tiles-highzoom
+        with:
+          pattern: tile-timings-highzoom-worker-*
+          path: download_tile_timings
+          merge-multiple: true
+
+      - name: Switch to Dedicated Timings Branch
+        # See update-region-timings for why this checkout is safe to run
+        # concurrently with that job's own checkout/commit/push of the same
+        # branch.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin "$TIMINGS_BRANCH" >/dev/null 2>&1; then
+            echo "Branch $TIMINGS_BRANCH exists - checking it out."
+            git fetch origin "$TIMINGS_BRANCH"
+            git checkout -B "$TIMINGS_BRANCH" "origin/$TIMINGS_BRANCH"
+          else
+            echo "Branch $TIMINGS_BRANCH doesn't exist yet - creating an orphan branch."
+            git checkout --orphan "$TIMINGS_BRANCH"
+            git rm -rf . > /dev/null
+          fi
 
       - name: Merge Tile Timings
         # Same rolling-history pattern as region timings, keyed by tile-grid
@@ -1253,16 +1347,16 @@ jobs:
           print(f"tile_timings.json now tracks {len(timings)} tile(s).")
           PYEOF
 
-      - name: Commit Updated Timings
+      - name: Commit Updated Tile Timings
         run: |
-          git add region_timings.json tile_timings.json
+          git add tile_timings.json
 
           if git diff --cached --quiet; then
             echo "No timing changes to commit."
             exit 0
           fi
 
-          git commit -m "chore: update region and tile processing timings"
+          git commit -m "chore: update tile processing timings"
 
           for attempt in 1 2 3 4 5; do
             if git ls-remote --exit-code --heads origin "$TIMINGS_BRANCH" >/dev/null 2>&1; then
@@ -1280,7 +1374,7 @@ jobs:
             echo "Push attempt $attempt failed, retrying in 5s..."
             sleep 5
           done
-          echo "Could not push updated timings after 5 attempts."
+          echo "Could not push updated tile timings after 5 attempts."
           exit 1
 
   combine-land-data:
