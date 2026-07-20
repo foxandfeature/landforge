@@ -991,7 +991,7 @@ jobs:
     # had. Skip entirely if a debug run ID is provided, same as
     # build-tiles-ndjson.
     if: ${{ github.event.inputs.debug_run_id == '' }}
-    needs: [prepare, setup-tools, prepare-tile-queue]
+    needs: [prepare-tile-queue]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1494,7 +1494,7 @@ jobs:
     # world-low-pmtiles was already built in debug_run_id's run - build-pmtiles
     # pulls it from there directly instead.
     if: ${{ !cancelled() && !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
-    needs: [combine-land-data, setup-tools]
+    needs: [combine-land-data]
     runs-on: ubuntu-latest
     steps:
       - name: Restore Tippecanoe Binaries from Cache
@@ -1566,7 +1566,7 @@ jobs:
     # `!cancelled()` lets this job still run when its needs were themselves
     # skipped, as on a DEBUG run with debug_resume_at: pmtile-generation.
     if: ${{ !cancelled() }}
-    needs: [build-tiles-highzoom, build-low-zoom-pmtiles, setup-tools]
+    needs: [build-tiles-highzoom, build-low-zoom-pmtiles]
     runs-on: ubuntu-latest
     steps:
       - name: Restore Tippecanoe Binaries from Cache
@@ -1699,5 +1699,3 @@ jobs:
       - name: Upload PMTiles Asset (Overwrite Existing)
         run: |
           gh release upload "$RELEASE_TAG" world.pmtiles --clobber
-
-          
