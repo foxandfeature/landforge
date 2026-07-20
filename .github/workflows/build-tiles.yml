@@ -28,8 +28,8 @@ permissions:
 
 env:
   # Dedicated orphan branches used purely as data/coordination stores, never
-  # merged into main. TIMINGS_BRANCH is shared by prepare, prepare-tile-queue,
-  # and update-timings (it holds both region_timings.json and
+  # merged into main. TIMINGS_BRANCH is shared by prepare-region-queue,
+  # prepare-tile-queue, and update-timings (it holds both region_timings.json and
   # tile_timings.json). QUEUE_BRANCH coordinates build-tiles-ndjson's
   # per-region claims; TILE_QUEUE_BRANCH is a second, independent queue that
   # coordinates build-tiles-highzoom's claims of tile-grid work units. Two
@@ -46,8 +46,8 @@ env:
   # fewer, chunkier work units that each need more regions' data fetched at
   # once; finer means more, smaller units with better load-balancing
   # granularity across the worker pool but more per-unit ogr2ogr/tippecanoe
-  # overhead. z=4 is sized for the ~20-worker pool in `prepare`; retune here
-  # if that pool size changes materially.
+  # overhead. z=4 is sized for the ~20-worker pool in `prepare-region-queue`;
+  # retune here if that pool size changes materially.
   TILE_GRID_ZOOM: "4"
 
 # Serializes runs so two concurrent workflows never race over
@@ -57,7 +57,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
+  prepare-region-queue:
     # Only computes a priority order (largest estimated region first) and
     # publishes it as a shared work queue on the region-queue branch. Actual
     # assignment happens live in build-tiles-ndjson: whichever of the (up to) 20
@@ -371,12 +371,12 @@ jobs:
     # region-queue and turns each into clipped, water-erased NDJSON. Skip
     # this heavy job entirely if a debug run ID is provided.
     if: ${{ github.event.inputs.debug_run_id == '' }}
-    needs: [prepare, setup-tools]
+    needs: [prepare-region-queue, setup-tools]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        worker: ${{ fromJSON(needs.prepare.outputs.worker_ids) }}
+        worker: ${{ fromJSON(needs.prepare-region-queue.outputs.worker_ids) }}
 
     steps:
       - name: Checkout Repository
@@ -610,6 +610,35 @@ jobs:
             done
           }
 
+          # The @actions/artifact SDK call itself can fail transiently (e.g.
+          # ETIMEDOUT reaching the Actions results service) exactly like any
+          # other network call - retry with the same backoff shape as the
+          # HTTP fetch helpers above, instead of discarding an otherwise
+          # fully-processed region over one flaky request.
+          publish_ndjson_artifact() {
+            local region_slug="$1" filename="$2"
+            local max_attempts=5 wait_seconds=15 attempt=1
+            while true; do
+              if node -e "
+                const { DefaultArtifactClient } = require('@actions/artifact');
+                (async () => {
+                  const client = new DefaultArtifactClient();
+                  await client.uploadArtifact('ndjson-${region_slug}', ['${filename}'], '.', { retentionDays: 1 });
+                })().catch((err) => { console.error(err); process.exit(1); });
+              "; then
+                return 0
+              fi
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Giving up publishing ndjson-${region_slug} after $attempt attempts."
+                return 1
+              fi
+              echo "Artifact upload attempt $attempt/$max_attempts for ndjson-${region_slug} failed (transient error, e.g. ETIMEDOUT). Retrying in ${wait_seconds}s..."
+              sleep "$wait_seconds"
+              attempt=$((attempt + 1))
+              wait_seconds=$((wait_seconds * 2))
+            done
+          }
+
           # Forging order: heat the raw ore (download), skim the slag off
           # (drop glaciers/wetlands from the water layer), cast and hammer
           # the land into shape (clip to boundary, then erase the water out
@@ -716,13 +745,7 @@ jobs:
               return 1
             }
 
-            node -e "
-              const { DefaultArtifactClient } = require('@actions/artifact');
-              (async () => {
-                const client = new DefaultArtifactClient();
-                await client.uploadArtifact('ndjson-${REGION_SLUG}', ['${FILENAME}'], '.', { retentionDays: 1 });
-              })().catch((err) => { console.error(err); process.exit(1); });
-            " || {
+            publish_ndjson_artifact "$REGION_SLUG" "$FILENAME" || {
               echo "Publishing $REGION's ndjson artifact failed."
               rm -f "$FILENAME"
               return 1
@@ -732,7 +755,7 @@ jobs:
             echo "Finished $REGION in ${ELAPSED_TIME}s."
             echo "| \`$REGION\` | $ELAPSED_TIME | done |" >> $GITHUB_STEP_SUMMARY
 
-            # Record the duration for prepare to fold into next month's average.
+            # Record the duration for prepare-region-queue to fold into next month's average.
             jq --arg region "$REGION" --argjson t "$ELAPSED_TIME" \
               '. + {($region): $t}' "$TIMINGS_FILE" > "${TIMINGS_FILE}.tmp" \
               && mv "${TIMINGS_FILE}.tmp" "$TIMINGS_FILE"
@@ -790,8 +813,8 @@ jobs:
     # region-queue only coordinates live claims while build-tiles-ndjson
     # runs; once every worker has emptied or given up on it, nothing reads
     # it again and its commit history (one commit per claim) is pure churn,
-    # so the branch is deleted rather than left around. `prepare` recreates
-    # it fresh next run.
+    # so the branch is deleted rather than left around. `prepare-region-queue`
+    # recreates it fresh next run.
     if: ${{ !cancelled() }}
     needs: [build-tiles-ndjson]
     runs-on: ubuntu-latest
@@ -808,8 +831,8 @@ jobs:
           fi
 
   prepare-tile-queue:
-    # Seeds build-tiles-highzoom's own queue, the same way `prepare` seeds
-    # build-tiles-ndjson's - except the unit of work is a coarse tile-grid
+    # Seeds build-tiles-highzoom's own queue, the same way
+    # `prepare-region-queue` seeds build-tiles-ndjson's - except the unit of work is a coarse tile-grid
     # cell (TILE_GRID_ZOOM), not a region. Sharding the high-zoom phase by
     # region let two geographic neighbors both contribute features to the
     # same z8-14 output tile, each deciding simplification/
@@ -894,7 +917,7 @@ jobs:
               tile_timings = json.load(f)
 
           def avg_of(history):
-              # Same reasoning as `prepare`'s region-averaging: a rolling
+              # Same reasoning as `prepare-region-queue`'s region-averaging: a rolling
               # average over the last few samples, not just the latest one.
               if not history:
                   return None
@@ -945,12 +968,12 @@ jobs:
                       # No tiling history for this cell yet - fall back to
                       # this run's fresh sum of its regions' ndjson-build
                       # time as a proxy, same two-tier fallback chain
-                      # `prepare` uses for regions.
+                      # `prepare-region-queue` uses for regions.
                       estimate = sum(elapsed.get(r, 0) for r in regions)
                   work_units.append({"tile": tile_id, "regions": regions, "estimate": estimate})
 
           # Sorted largest-first, same largest-estimate-first philosophy as
-          # `prepare`'s region-queue.
+          # `prepare-region-queue`'s region-queue.
           work_units.sort(key=lambda u: u["estimate"], reverse=True)
 
           print(f"Queued {len(work_units)} tile(s) (of {n * n} grid cells) for tiling:")
@@ -962,9 +985,9 @@ jobs:
           PYEOF
 
       - name: Publish Tile Queue for This Run
-        # Always resets tile-queue from scratch, same as `prepare`'s
-        # region-queue - safe unconditionally under the top-level
-        # `concurrency` group.
+        # Always resets tile-queue from scratch, same as
+        # `prepare-region-queue`'s region-queue - safe unconditionally under
+        # the top-level `concurrency` group.
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -991,12 +1014,16 @@ jobs:
     # had. Skip entirely if a debug run ID is provided, same as
     # build-tiles-ndjson.
     if: ${{ github.event.inputs.debug_run_id == '' }}
+<<<<<<< HEAD
     needs: [prepare-tile-queue]
+=======
+    needs: [prepare-region-queue, setup-tools, prepare-tile-queue]
+>>>>>>> ae02e4459cb9870e9d2024272fd81c7113b05f28
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        worker: ${{ fromJSON(needs.prepare.outputs.worker_ids) }}
+        worker: ${{ fromJSON(needs.prepare-region-queue.outputs.worker_ids) }}
 
     steps:
       - name: Checkout Repository
@@ -1089,6 +1116,35 @@ jobs:
             return 1
           }
 
+          # Mirrors build-tiles-ndjson's publish_ndjson_artifact: the
+          # @actions/artifact SDK can fail transiently (e.g. ETIMEDOUT) the
+          # same as any other network call, so retry with backoff rather than
+          # failing the whole tile over one flaky request.
+          fetch_ndjson_artifact() {
+            local region_slug="$1"
+            local max_attempts=5 wait_seconds=15 attempt=1
+            while true; do
+              if node -e "
+                const { DefaultArtifactClient } = require('@actions/artifact');
+                (async () => {
+                  const client = new DefaultArtifactClient();
+                  const { artifact } = await client.getArtifact('ndjson-${region_slug}');
+                  await client.downloadArtifact(artifact.id, { path: '.' });
+                })().catch((err) => { console.error(err); process.exit(1); });
+              "; then
+                return 0
+              fi
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Giving up fetching ndjson-${region_slug} after $attempt attempts."
+                return 1
+              fi
+              echo "Artifact download attempt $attempt/$max_attempts for ndjson-${region_slug} failed (transient error, e.g. ETIMEDOUT). Retrying in ${wait_seconds}s..."
+              sleep "$wait_seconds"
+              attempt=$((attempt + 1))
+              wait_seconds=$((wait_seconds * 2))
+            done
+          }
+
           tile_work_unit() {
             local CLAIMED="$1"
             local START_TIME=$SECONDS
@@ -1108,14 +1164,9 @@ jobs:
             while IFS= read -r REGION; do
               local REGION_SLUG; REGION_SLUG=$(echo "$REGION" | tr '/' '-')
               local FILENAME="${REGION_SLUG}.ndjson.gz"
-              node -e "
-                const { DefaultArtifactClient } = require('@actions/artifact');
-                (async () => {
-                  const client = new DefaultArtifactClient();
-                  const { artifact } = await client.getArtifact('ndjson-${REGION_SLUG}');
-                  await client.downloadArtifact(artifact.id, { path: '.' });
-                })().catch((err) => { console.error(err); process.exit(1); });
-              " || { echo "Couldn't fetch $REGION's ndjson artifact for tile $TILE."; return 1; }
+              fetch_ndjson_artifact "$REGION_SLUG" || {
+                echo "Couldn't fetch $REGION's ndjson artifact for tile $TILE."; return 1;
+              }
 
               gunzip -c "$FILENAME" >> combined.ndjson || {
                 echo "Couldn't decompress $REGION's ndjson artifact for tile $TILE."; return 1;
@@ -1241,9 +1292,11 @@ jobs:
     # succeeding: with per-region failure isolation, some regions can fail
     # while others finish fine, and those timings are still worth keeping.
     # A debug run skips both build-tiles-* jobs entirely, which the merge
-    # step below already handles gracefully.
+    # step below already handles gracefully. Only build-tiles-highzoom is
+    # listed below - it already needs build-tiles-ndjson transitively via
+    # prepare-tile-queue, so listing both here would just be a duplicate edge.
     if: ${{ !cancelled() }}
-    needs: [build-tiles-ndjson, build-tiles-highzoom]
+    needs: [build-tiles-highzoom]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -1284,14 +1337,16 @@ jobs:
 
       - name: Merge Region Timings
         # This is purely phase-1 (ndjson-build) time per region - the sole
-        # input to `prepare`'s region-queue ordering. Tiling time is no
-        # longer attributable to a single region now that build-tiles-highzoom
-        # shards by tile-grid cell (see prepare-tile-queue), so it's tracked
-        # separately below instead of being summed in here.
+        # input to `prepare-region-queue`'s region-queue ordering. Tiling time
+        # is no longer attributable to a single region now that
+        # build-tiles-highzoom shards by tile-grid cell (see
+        # prepare-tile-queue), so it's tracked separately below instead of
+        # being summed in here.
         env:
-          # How many recent measurements to keep per region - prepare
-          # averages over this history so one bad-connection run fades out
-          # instead of permanently skewing the estimate.
+          # How many recent measurements to keep per region -
+          # prepare-region-queue averages over this history so one
+          # bad-connection run fades out instead of permanently skewing the
+          # estimate.
           TIMING_HISTORY_LENGTH: "5"
         run: |
           if [ ! -f region_timings.json ]; then echo '{}' > region_timings.json; fi
