@@ -10,18 +10,6 @@ on:
         required: true
         default: "ALL_REGIONS"
         type: string
-      debug_run_id:
-        description: "DEBUG: Run ID to download existing artifacts from (skips tile generation)"
-        required: false
-        type: string
-      debug_resume_at:
-        description: "DEBUG: Only used when debug_run_id is set. Where to resume the pipeline from, using that run's artifacts."
-        required: false
-        type: choice
-        options:
-          - regions-merge
-          - pmtile-generation
-        default: regions-merge
 
 permissions:
   contents: write
@@ -50,6 +38,16 @@ env:
   # overhead. z=4 is sized for the ~20-worker pool in `prepare-region-queue`;
   # retune here if that pool size changes materially.
   TILE_GRID_ZOOM: "4"
+  # Hard cap on how many tile-grid cells a single build-tiles-highzoom
+  # worker will claim before it stops and exits cleanly. GitHub Actions
+  # hosted runners have a hard 6h per-job limit; no single cell takes
+  # anywhere near that long to tile, but a fast/unlucky worker claiming
+  # many cells back-to-back from the shared queue can still accumulate
+  # past 6h in total. Capping the per-worker claim count bounds each
+  # worker's worst case regardless of per-cell cost. prepare-tile-queue
+  # sizes its worker pool off this same constant so every cell still gets
+  # claimed exactly once despite the cap (see its worker-count comment).
+  MAX_TILES_PER_WORKER: "5"
 
 # Serializes runs so two concurrent workflows never race over
 # region_timings.json, the tippecanoe/land-data caches, or region-queue.
@@ -369,9 +367,7 @@ jobs:
 
   build-tiles-ndjson:
     # Phase 1 of 2 (see build-tiles-highzoom below): claims regions from
-    # region-queue and turns each into clipped, water-erased NDJSON. Skip
-    # this heavy job entirely if a debug run ID is provided.
-    if: ${{ github.event.inputs.debug_run_id == '' }}
+    # region-queue and turns each into clipped, water-erased NDJSON.
     needs: [prepare-region-queue, setup-tools]
     runs-on: ubuntu-latest
     strategy:
@@ -775,8 +771,8 @@ jobs:
     # the combined stream comes back empty (see tile_work_unit), instead
     # of being predicted and filtered out here.
     #
-    # `!cancelled()` (not just the debug_run_id check) matters here the same
-    # way it does for combine-land-data/update-region-timings/update-tile-timings: build-tiles-ndjson
+    # `!cancelled()` matters here the same way it does for
+    # combine-land-data/update-region-timings/update-tile-timings: build-tiles-ndjson
     # deliberately exits non-zero whenever any individual region failed
     # (expected and normal across hundreds of regions, per this file's
     # failure-isolation convention), which without an explicit status
@@ -785,7 +781,7 @@ jobs:
     # (build-tiles-highzoom, cleanup-tile-queue, build-pmtiles) - even
     # though every region that DID finish phase 1 is still perfectly fine
     # to tile.
-    if: ${{ !cancelled() && github.event.inputs.debug_run_id == '' }}
+    if: ${{ !cancelled() }}
     needs: [build-tiles-ndjson]
     runs-on: ubuntu-latest
     outputs:
@@ -811,17 +807,11 @@ jobs:
 
       - name: Compute the Tile Grid and Publish Tile Work Units
         id: tiles
-        env:
-          # Sized the same as prepare-region-queue's NUM_WORKERS - this is a
-          # second, independent worker pool (see build-tiles-highzoom), not
-          # a reuse of the phase-1 pool, so it gets its own cap rather than
-          # reading build-tiles-ndjson's worker count.
-          NUM_WORKERS: "20"
         run: |
           python3 << 'PYEOF'
-          import json, os
+          import json, math, os
 
-          NUM_WORKERS = int(os.environ["NUM_WORKERS"])
+          MAX_TILES_PER_WORKER = int(os.environ["MAX_TILES_PER_WORKER"])
           ZOOM = int(os.environ["TILE_GRID_ZOOM"])
 
           with open("tile_timings.json") as f:
@@ -858,9 +848,14 @@ jobs:
           # simply sort after every cell that does.
           work_units.sort(key=lambda u: u["estimate"], reverse=True)
 
-          num_workers = min(NUM_WORKERS, len(work_units)) or 1
+          # Sized off MAX_TILES_PER_WORKER (see its top-of-file comment)
+          # rather than a fixed pool like prepare-region-queue's, so every
+          # cell still gets claimed exactly once even with the per-worker
+          # claim cap build-tiles-highzoom's loop enforces - a fixed 20-worker
+          # pool with a 5-tile cap would strand 156 of 256 cells unclaimed.
+          num_workers = math.ceil(len(work_units) / MAX_TILES_PER_WORKER) if work_units else 1
 
-          print(f"Queued {len(work_units)} tile(s) (of {n * n} grid cells) for {num_workers} worker(s):")
+          print(f"Queued {len(work_units)} tile(s) (of {n * n} grid cells) for {num_workers} worker(s) (max {MAX_TILES_PER_WORKER} tile(s) each):")
           for u in work_units:
               print(f"  {u['tile']}: ~{u['estimate']:.0f}s estimated")
 
@@ -900,8 +895,7 @@ jobs:
     # than by region (see prepare-tile-queue) also means no two work units
     # can ever produce the same z8-14 output tile, eliminating the
     # cross-region simplification-seam problem the old per-region sharding
-    # had. Skip entirely if a debug run ID is provided, same as
-    # build-tiles-ndjson.
+    # had.
     #
     # `!cancelled()` matters here for the same reason it does for
     # prepare-tile-queue: combine-land-data (now a direct dependency, for
@@ -909,7 +903,7 @@ jobs:
     # some region archives were corrupt, while still uploading whatever DID
     # combine successfully - without an explicit status function this job
     # would otherwise be skipped entirely whenever that happens.
-    if: ${{ !cancelled() && github.event.inputs.debug_run_id == '' }}
+    if: ${{ !cancelled() }}
     needs: [prepare-tile-queue, combine-land-data]
     runs-on: ubuntu-latest
     strategy:
@@ -1075,10 +1069,21 @@ jobs:
             return 0
           }
 
-          while true; do
+          # Caps how many tiles this worker will claim, even if it's fast
+          # enough that the shared queue would otherwise keep feeding it
+          # more: no single cell takes anywhere near GitHub Actions' hard 6h
+          # per-job limit, but an unlucky worker claiming many cells
+          # back-to-back can still accumulate past it. prepare-tile-queue
+          # sizes the worker pool off this same MAX_TILES_PER_WORKER so
+          # every cell still gets claimed by someone despite the cap - a
+          # worker stopping here just leaves the rest in tile-queue for
+          # another worker to pick up.
+          TILES_CLAIMED=0
+          while [ "$TILES_CLAIMED" -lt "$MAX_TILES_PER_WORKER" ]; do
             TILE=$(claim_tile) || break
+            TILES_CLAIMED=$((TILES_CLAIMED + 1))
 
-            echo "Claimed tile $TILE"
+            echo "Claimed tile $TILE ($TILES_CLAIMED/$MAX_TILES_PER_WORKER for this worker)"
 
             if ! tile_work_unit "$TILE"; then
               echo "::error::Tile $TILE failed - discarding it, moving on to the next tile."
@@ -1147,8 +1152,7 @@ jobs:
     # Runs whenever build-tiles-ndjson executed and wasn't cancelled,
     # deliberately not gated on it fully succeeding: with per-region failure
     # isolation, some regions can fail while others finish fine, and those
-    # timings are still worth keeping. A debug run skips build-tiles-ndjson
-    # entirely, which the merge step below already handles gracefully.
+    # timings are still worth keeping.
     #
     # Split out from tile timings (see update-tile-timings) because the two
     # fed genuinely separate histories already (region_timings.json vs
@@ -1167,7 +1171,7 @@ jobs:
 
       - name: Download Per-Worker NDJSON-Phase Timings
         uses: actions/download-artifact@v4
-        continue-on-error: true # no artifacts if every worker failed before finishing a single region, or a debug run skipped build-tiles-ndjson
+        continue-on-error: true # no artifacts if every worker failed before finishing a single region
         with:
           pattern: region-timings-ndjson-worker-*
           path: download_ndjson_timings
@@ -1285,7 +1289,7 @@ jobs:
 
       - name: Download Per-Worker Tile-Phase Timings
         uses: actions/download-artifact@v4
-        continue-on-error: true # no artifacts if every worker failed before finishing a single tile, or a debug run skipped build-tiles-highzoom
+        continue-on-error: true # no artifacts if every worker failed before finishing a single tile
         with:
           pattern: tile-timings-highzoom-worker-*
           path: download_tile_timings
@@ -1379,44 +1383,30 @@ jobs:
 
   combine-land-data:
     # Does the decompress+concatenate work exactly once, as its own job
-    # (rather than inlined into build-low-zoom-pmtiles) so a DEBUG run can
-    # pull already-processed geometry from an older run without re-running
-    # build-tiles-ndjson. Only feeds the global low-zoom (z0-7) shard now -
-    # the z8-14 shards are built directly from each tile-grid cell's regions
-    # in build-tiles-highzoom, without ever passing through this combined
-    # stream. Needs only build-tiles-ndjson (not build-tiles-highzoom too) -
-    # that's the whole point of the two-phase split, so this job and the
-    # low-zoom pass it feeds can run concurrently with tiling instead of
-    # waiting for it. Not gated on build-tiles-ndjson fully succeeding (only
-    # on not cancelled): every region that DID finish still made it into an
-    # artifact, and the low-zoom shard should still build from those.
-    # Skipped when debug_resume_at is "pmtile-generation", since
-    # world-low-pmtiles was already built in debug_run_id's run.
-    if: ${{ !cancelled() && !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
+    # (rather than inlined into build-low-zoom-pmtiles). Only feeds the
+    # global low-zoom (z0-7) shard now - the z8-14 shards are built directly
+    # from each tile-grid cell's regions in build-tiles-highzoom, without
+    # ever passing through this combined stream. Needs only
+    # build-tiles-ndjson (not build-tiles-highzoom too) - that's the whole
+    # point of the two-phase split, so this job and the low-zoom pass it
+    # feeds can run concurrently with tiling instead of waiting for it. Not
+    # gated on build-tiles-ndjson fully succeeding (only on not cancelled):
+    # every region that DID finish still made it into an artifact, and the
+    # low-zoom shard should still build from those.
+    if: ${{ !cancelled() }}
     needs: [build-tiles-ndjson]
     runs-on: ubuntu-latest
     steps:
-      - name: Download Land Geometry (Standard Workflow Execution)
+      - name: Download Land Geometry
         # Each build-tiles-ndjson worker published one bundled artifact
         # (ndjson-worker-N) holding every region it finished; the
         # `ndjson-worker-*` pattern below collects all workers' bundles in
         # one merge-multiple call.
-        if: ${{ github.event.inputs.debug_run_id == '' }}
         uses: actions/download-artifact@v4
         with:
           pattern: ndjson-worker-*
           path: download_ndjson
           merge-multiple: true
-
-      - name: Download Land Geometry (DEBUG Mode - Targets Older Workflow Run)
-        if: ${{ github.event.inputs.debug_run_id != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ndjson-worker-*
-          path: download_ndjson
-          merge-multiple: true
-          run-id: ${{ github.event.inputs.debug_run_id }}
-          github-token: ${{ github.token }}
 
       - name: Concatenate All Regions into One Global Stream
         run: |
@@ -1474,11 +1464,7 @@ jobs:
     # range (see build-tiles-highzoom for why z8-14 is instead parallelized
     # per-worker - and note this job now runs concurrently with that one,
     # not after it, since combine-land-data only depends on build-tiles-ndjson).
-    #
-    # Skipped when debug_resume_at is "pmtile-generation", since
-    # world-low-pmtiles was already built in debug_run_id's run - build-pmtiles
-    # pulls it from there directly instead.
-    if: ${{ !cancelled() && !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
+    if: ${{ !cancelled() }}
     needs: [combine-land-data]
     runs-on: ubuntu-latest
     steps:
@@ -1495,9 +1481,7 @@ jobs:
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
       - name: Download Combined Land Data
-        # combine-land-data always ran earlier in THIS run whenever this job
-        # runs (see the "if" above) - no debug-mode branch needed here, only
-        # in build-pmtiles below (which this shard still has to reach through).
+        # combine-land-data always ran earlier in THIS run whenever this job runs.
         uses: actions/download-artifact@v4
         with:
           name: world-land-ndjson
@@ -1547,9 +1531,6 @@ jobs:
     # beyond -pk below. build-tiles-highzoom and build-low-zoom-pmtiles run
     # concurrently (see build-tiles-ndjson/combine-land-data), so this job
     # just waits on whichever finishes last.
-    #
-    # `!cancelled()` lets this job still run when its needs were themselves
-    # skipped, as on a DEBUG run with debug_resume_at: pmtile-generation.
     if: ${{ !cancelled() }}
     needs: [build-tiles-highzoom, build-low-zoom-pmtiles]
     runs-on: ubuntu-latest
@@ -1566,47 +1547,18 @@ jobs:
           sudo cp tippecanoe-bin/tippecanoe tippecanoe-bin/tile-join /usr/local/bin/
           sudo chmod +x /usr/local/bin/tippecanoe /usr/local/bin/tile-join
 
-      - name: Download Low-Zoom Shard (Standard Workflow Execution, or DEBUG Resuming at Regions-Merge)
-        # Covers a normal run and a DEBUG run resuming at "regions-merge" -
-        # in both cases build-low-zoom-pmtiles ran earlier in THIS run.
-        if: ${{ !(github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation') }}
+      - name: Download Low-Zoom Shard
         uses: actions/download-artifact@v4
         with:
           name: world-low-pmtiles
           path: shards
 
-      - name: Download Low-Zoom Shard (DEBUG Mode - Resuming at PMTiles Generation)
-        # build-low-zoom-pmtiles was skipped this run, so pull the
-        # already-built shard straight from debug_run_id's own run.
-        if: ${{ github.event.inputs.debug_run_id != '' && github.event.inputs.debug_resume_at == 'pmtile-generation' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: world-low-pmtiles
-          path: shards
-          run-id: ${{ github.event.inputs.debug_run_id }}
-          github-token: ${{ github.token }}
-
-      - name: Download High-Zoom Shards (Standard Workflow Execution, or Any DEBUG Resume)
-        # build-tiles-highzoom is skipped whenever debug_run_id is set at all
-        # (regardless of debug_resume_at), so its worker shards only exist as
-        # same-run artifacts on a standard run - a debug run always needs
-        # them from debug_run_id instead.
-        if: ${{ github.event.inputs.debug_run_id == '' }}
+      - name: Download High-Zoom Shards
         uses: actions/download-artifact@v4
         with:
           pattern: highzoom-worker-*
           path: shards
           merge-multiple: true
-
-      - name: Download High-Zoom Shards (DEBUG Mode - Targets Older Workflow Run)
-        if: ${{ github.event.inputs.debug_run_id != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          pattern: highzoom-worker-*
-          path: shards
-          merge-multiple: true
-          run-id: ${{ github.event.inputs.debug_run_id }}
-          github-token: ${{ github.token }}
 
       - name: Join Shards into the Final Global PMTiles Archive
         run: |
