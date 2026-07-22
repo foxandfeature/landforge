@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       region:
-        description: "Region path from Geofabrik's index (e.g. europe/germany/niedersachsen), or ALL_REGIONS. GitHub Actions choice inputs can't be populated dynamically from a live index, so this is free text - browse https://download.geofabrik.de to find the exact path of a region that has its own free shapefile (not a multi-region bundle like 'US Midwest')."
+        description: "Region path from Geofabrik's index (e.g. europe/germany/niedersachsen), a comma-separated list of paths (e.g. europe/liechtenstein,europe/austria/vorarlberg) to process multiple regions in one run, or ALL_REGIONS. GitHub Actions choice inputs can't be populated dynamically from a live index, so this is free text - browse https://download.geofabrik.de to find the exact path of a region that has its own free shapefile (not a multi-region bundle like 'US Midwest')."
         required: true
         default: "ALL_REGIONS"
         type: string
@@ -176,23 +176,35 @@ jobs:
               if skipped:
                   print(f"Skipping {len(skipped)} known-broken region(s) per known_broken_regions.json: {skipped}")
           else:
-              # Validate free-text input against the Geofabrik-derived pool
-              # so a typo fails fast instead of a cryptic 404 minutes later.
-              if manual_region not in all_regions_pool:
-                  sys.exit(
-                      f"'{manual_region}' was not found among Geofabrik's leaf regions "
-                      "(or it's a Special Sub Region bundle without its own shapefile, "
-                      "like 'US Midwest', which this pipeline skips). "
-                      "Check the exact path (e.g. europe/germany/niedersachsen) against "
-                      "https://download.geofabrik.de and try again, or use ALL_REGIONS."
-                  )
-              if manual_region in known_broken:
-                  print(
-                      f"'{manual_region}' is listed in known_broken_regions.json - "
-                      "running it anyway since it was explicitly requested. Remove it "
-                      "from that file if Geofabrik has fixed the shapefile."
-                  )
-              all_regions = [manual_region]
+              # Comma-separated list support: lets a manual test run process
+              # two (or more) regions in one go - needed to validate fixes
+              # that only show up across a region boundary (e.g.
+              # combine-land-data's cross-region dissolve step has nothing to
+              # dissolve against with only one region in the run). A single
+              # path with no comma behaves exactly as before (a 1-element
+              # list).
+              manual_regions = [r.strip() for r in manual_region.split(",") if r.strip()]
+              if not manual_regions:
+                  sys.exit("The 'region' input was empty after parsing - provide a Geofabrik path, a comma-separated list of paths, or ALL_REGIONS.")
+
+              for r in manual_regions:
+                  # Validate free-text input against the Geofabrik-derived pool
+                  # so a typo fails fast instead of a cryptic 404 minutes later.
+                  if r not in all_regions_pool:
+                      sys.exit(
+                          f"'{r}' was not found among Geofabrik's leaf regions "
+                          "(or it's a Special Sub Region bundle without its own shapefile, "
+                          "like 'US Midwest', which this pipeline skips). "
+                          "Check the exact path (e.g. europe/germany/niedersachsen) against "
+                          "https://download.geofabrik.de and try again, or use ALL_REGIONS."
+                      )
+                  if r in known_broken:
+                      print(
+                          f"'{r}' is listed in known_broken_regions.json - "
+                          "running it anyway since it was explicitly requested. Remove it "
+                          "from that file if Geofabrik has fixed the shapefile."
+                      )
+              all_regions = manual_regions
 
           def avg_of(history):
               # Averaging the last few measured durations (see
@@ -1443,6 +1455,58 @@ jobs:
             echo "world.pmtiles will be missing land data for those region(s) this run."
             exit 1
           fi
+
+      - name: Install Mapshaper
+        # Only mapshaper - unlike build-tiles-ndjson's equivalent install
+        # step, this job never calls ogr2ogr, so gdal-bin isn't needed here.
+        run: |
+          sudo apt-get update && sudo apt-get install -y nodejs npm
+          sudo npm install -g mapshaper
+
+      - name: Dissolve Cross-Region Border Slivers
+        env:
+          # Regions were clipped independently along political .poly
+          # boundaries, not natural coastline breaks, so a landmass cut at a
+          # border becomes several small, low-vertex fragments that
+          # Tippecanoe's --simplification=10 (build-low-zoom-pmtiles,
+          # build-tiles-highzoom) collapses into visible triangles even
+          # though the whole shape should simplify as one. -dissolve2 merges
+          # touching/overlapping fragments by polygon union - tolerant of the
+          # near-but-not-exact seams independent clips produce, unlike plain
+          # -dissolve's topology-based merge, which would need pre-snapped
+          # input to reliably catch these seams. -explode then splits the
+          # dissolved result back into one feature per disjoint landmass, so
+          # genuinely separate islands far from any border stay separate
+          # rather than being collapsed into one giant multi-part feature.
+          # This is a full-globe pass over data at similar scale to
+          # build-tiles-ndjson's per-region erase, which already needed a
+          # raised heap - start at that same proven ceiling and re-tune once
+          # real memory usage from a run is known.
+          NODE_OPTIONS: "--max-old-space-size=6144"
+        run: |
+          echo "Feature count before dissolve: $(wc -l < world_land.ndjson)"
+          echo "Size before dissolve:"; du -h world_land.ndjson
+
+          DISSOLVE_START=$SECONDS
+          if ! timeout 2h /usr/bin/time -v mapshaper world_land.ndjson -i format=geojson \
+              -dissolve2 \
+              -explode \
+              -o world_land_dissolved.ndjson format=geojson ndjson 2> dissolve_time.log; then
+            echo "::error::Dissolve step failed, timed out, or was killed (likely OOM) after $(( SECONDS - DISSOLVE_START ))s."
+            cat dissolve_time.log
+            exit 1
+          fi
+
+          if [ ! -s world_land_dissolved.ndjson ]; then
+            echo "::error::Dissolve step produced an empty output."
+            exit 1
+          fi
+
+          mv world_land_dissolved.ndjson world_land.ndjson
+          echo "Dissolve finished in $(( SECONDS - DISSOLVE_START ))s."
+          echo "Feature count after dissolve: $(wc -l < world_land.ndjson)"
+          echo "Size after dissolve:"; du -h world_land.ndjson
+          grep "Maximum resident set size" dissolve_time.log || true
 
       - name: Upload Combined Land Data
         if: always() # A partial world_land.ndjson (bad region(s) skipped above) should still flow to build-low-zoom-pmtiles rather than losing the whole month's run.
